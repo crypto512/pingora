@@ -5,12 +5,13 @@ Functional test for the transparent-proxy socket options added to `pingora-core`
 `BindTo.ip_transparent` / `so_mark` on the upstream connector).
 
 It builds a small binary that links `pingora-core` and drives real traffic
-through a Linux `client -> router` network-namespace topology, covering:
+through a Linux `client -> router` network-namespace topology, covering each
+mode over **both IPv4 and IPv6** (6 tests total):
 
 | Test | Interception | Original destination read via | pingora API exercised |
 |------|--------------|-------------------------------|-----------------------|
-| NAT REDIRECT | `iptables -t nat ... -j REDIRECT` | `SO_ORIGINAL_DST` | `ext::get_original_dest` |
-| TPROXY | `iptables -t mangle ... -j TPROXY` | `getsockname` (local addr) | IP_TRANSPARENT listener |
+| NAT REDIRECT | `ip[6]tables -t nat ... -j REDIRECT` | `SO_ORIGINAL_DST` / `IP6T_SO_ORIGINAL_DST` | `ext::get_original_dest` |
+| TPROXY | `ip[6]tables -t mangle ... -j TPROXY` | `getsockname` (local addr) | IP_TRANSPARENT / IPV6_TRANSPARENT listener |
 | Upstream spoof | — | backend observes client IP | `ext::connect` + `BindTo::set_ip_transparent` |
 
 For the full explanation and production host setup, see
@@ -42,8 +43,11 @@ for glibc 2.41), or build the binary inside the container instead of mounting it
 Expected output:
 
 ```
-### TEST 1: NAT REDIRECT ...   PASS: NAT original dest recovered
-### TEST 2: TPROXY ...         PASS: TPROXY original dest via getsockname
-### TEST 3: transparent UPSTREAM spoof ...  PASS: upstream saw spoofed source 5.5.5.5
-### RESULT: 3 passed, 0 failed
+### TEST 1: NAT REDIRECT ...        PASS
+### TEST 2: TPROXY ...              PASS
+### TEST 3: transparent UPSTREAM ...PASS
+### TEST 4 (IPv6): NAT REDIRECT ... PASS
+### TEST 5 (IPv6): TPROXY ...       PASS
+### TEST 6 (IPv6): UPSTREAM ...     PASS
+### RESULT: 6 passed, 0 failed
 ```
