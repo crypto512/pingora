@@ -120,9 +120,12 @@ pub struct TcpSocketOptions {
     /// [SO_RCVBUF](https://man7.org/linux/man-pages/man7/socket.7.html).
     pub tcp_recv_buf: Option<usize>,
     /// Enable IP_TRANSPARENT socket option for TPROXY transparent proxy mode (Linux only).
-    /// This allows binding to non-local IP addresses and is required for iptables TPROXY target.
+    /// This allows binding to non-local IP addresses and is required for the iptables TPROXY
+    /// target. Under TPROXY the original destination is the accepted connection's local address,
+    /// available via `Session::server_addr()` (NOT `get_original_dest`, which is for NAT REDIRECT).
     /// Requires CAP_NET_ADMIN capability.
-    /// See the [kernel docs](https://docs.kernel.org/networking/tproxy.html) for more information.
+    /// See the [kernel docs](https://docs.kernel.org/networking/tproxy.html) and
+    /// `docs/user_guide/transparent_proxy.md` for the full host setup.
     #[cfg(target_os = "linux")]
     pub ip_transparent: Option<bool>,
     /// Set SO_MARK socket option for policy routing (Linux only).
