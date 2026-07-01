@@ -21,6 +21,7 @@ In this guide, we will cover the most used features, operations and settings of 
 * [Connection pooling and reuse](pooling.md)
 * [Handling failures and failover](failover.md)
 * [RateLimiter quickstart](rate_limiter.md)
+* [Transparent proxying (NAT REDIRECT and TPROXY)](transparent_proxy.md)
 
 ## Advanced topics (WIP)
 * [Pingora internals](internals.md)
