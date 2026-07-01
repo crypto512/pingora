@@ -571,6 +571,17 @@ async fn inner_connect_with<F: FnOnce(&TcpSocket) -> Result<()>>(
             }
 
             if let Some(baddr) = bind_to.addr {
+                // SO_REUSEADDR before bind(): for fully-transparent proxying the
+                // upstream socket binds the client's *exact* source ip:port, so a
+                // recently-closed upstream connection lingering in TIME_WAIT for
+                // that same local address would otherwise make bind() fail with
+                // EADDRINUSE under connection churn. SO_REUSEADDR permits rebinding
+                // a TIME_WAIT-held local address; it does NOT let two live sockets
+                // share an identical 4-tuple, so genuine active collisions still
+                // error as before.
+                socket
+                    .set_reuseaddr(true)
+                    .or_err(SocketError, "failed to set socket opts SO_REUSEADDR")?;
                 socket
                     .bind(baddr)
                     .or_err_with(BindError, || format!("failed to bind to socket {}", baddr))?;
@@ -581,6 +592,10 @@ async fn inner_connect_with<F: FnOnce(&TcpSocket) -> Result<()>>(
     #[cfg(windows)]
     if let Some(bind_to) = bind_to {
         if let Some(baddr) = bind_to.addr {
+            // See the unix branch: allow rebinding a TIME_WAIT-held source address.
+            socket
+                .set_reuseaddr(true)
+                .or_err(SocketError, "failed to set socket opts SO_REUSEADDR")?;
             socket
                 .bind(baddr)
                 .or_err_with(BindError, || format!("failed to bind to socket {}", baddr))?;
