@@ -46,6 +46,17 @@ pub struct BindTo {
     port_range: Option<(u16, u16)>,
     // whether we fallback and try again on bind errors when a port range is set
     fallback: bool,
+    /// Set IP_TRANSPARENT on the upstream socket before binding, allowing it to
+    /// bind to and send from a non-local source address (e.g. the client's) for
+    /// fully transparent (source-spoofing) proxying. Pair with `addr` set to the
+    /// client's address. Requires CAP_NET_ADMIN. Linux only.
+    #[cfg(target_os = "linux")]
+    pub ip_transparent: bool,
+    /// Set SO_MARK on the upstream socket for policy routing, e.g. to steer
+    /// spoofed-source upstream traffic through a dedicated routing table.
+    /// Requires CAP_NET_ADMIN. Linux only.
+    #[cfg(target_os = "linux")]
+    pub so_mark: Option<u32>,
 }
 
 impl BindTo {

@@ -210,6 +210,24 @@ fn ip_local_port_range(_fd: RawSocket, _low: u16, _high: u16) -> io::Result<()> 
     Ok(())
 }
 
+/// Set IP_TRANSPARENT (IPv4) or IPV6_TRANSPARENT (IPv6) so the socket may bind
+/// to and send from a non-local source address, e.g. for fully transparent
+/// (source-spoofing) proxying. Must be set before bind(). Requires CAP_NET_ADMIN.
+#[cfg(target_os = "linux")]
+fn set_ip_transparent(fd: RawFd, is_ipv6: bool) -> io::Result<()> {
+    if is_ipv6 {
+        set_opt(fd, libc::IPPROTO_IPV6, libc::IPV6_TRANSPARENT, true as c_int)
+    } else {
+        set_opt(fd, libc::IPPROTO_IP, libc::IP_TRANSPARENT, true as c_int)
+    }
+}
+
+/// Set SO_MARK on the socket for policy routing.
+#[cfg(target_os = "linux")]
+fn set_so_mark(fd: RawFd, mark: u32) -> io::Result<()> {
+    set_opt(fd, libc::SOL_SOCKET, libc::SO_MARK, mark as c_int)
+}
+
 #[cfg(target_os = "linux")]
 fn set_so_keepalive(fd: RawFd, val: bool) -> io::Result<()> {
     set_opt(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, val as c_int)
@@ -494,6 +512,13 @@ pub(crate) async fn connect_with<F: FnOnce(&TcpSocket) -> Result<()> + Clone>(
             if matches!(e.etype(), BindError) {
                 let mut new_bind_to = BindTo::default();
                 new_bind_to.addr = bind_to.as_ref().and_then(|b| b.addr);
+                // preserve transparent proxy settings across the retry
+                #[cfg(target_os = "linux")]
+                {
+                    new_bind_to.ip_transparent =
+                        bind_to.as_ref().is_some_and(|b| b.ip_transparent);
+                    new_bind_to.so_mark = bind_to.as_ref().and_then(|b| b.so_mark);
+                }
                 // reset the port range
                 new_bind_to.set_port_range(None).unwrap();
                 return inner_connect_with(addr, Some(&new_bind_to), set_socket).await;
@@ -526,6 +551,20 @@ async fn inner_connect_with<F: FnOnce(&TcpSocket) -> Result<()>>(
         )?;
 
         if let Some(bind_to) = bind_to {
+            // IP_TRANSPARENT must be set before bind() so the socket can bind to
+            // a non-local (spoofed client) source address for full transparency.
+            #[cfg(target_os = "linux")]
+            if bind_to.ip_transparent {
+                set_ip_transparent(socket.as_raw_fd(), addr.is_ipv6())
+                    .or_err(SocketError, "failed to set socket opts IP_TRANSPARENT")?;
+            }
+
+            #[cfg(target_os = "linux")]
+            if let Some(mark) = bind_to.so_mark {
+                set_so_mark(socket.as_raw_fd(), mark)
+                    .or_err(SocketError, "failed to set socket opts SO_MARK")?;
+            }
+
             if let Some((low, high)) = bind_to.port_range() {
                 ip_local_port_range(socket.as_raw_fd(), low, high)
                     .or_err(SocketError, "failed to set socket opts IP_LOCAL_PORT_RANGE")?;
