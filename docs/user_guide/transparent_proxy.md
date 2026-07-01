@@ -189,7 +189,39 @@ hits that policy route.
 
 ---
 
-## 5. Verifying your setup
+## 5. IPv6
+
+All three code paths support IPv6, and pingora selects the right option based on
+the address family automatically:
+
+- **Listener:** `TcpSocketOptions { ip_transparent: Some(true), .. }` sets
+  `IP_TRANSPARENT` on v4 sockets and `IPV6_TRANSPARENT` on v6 sockets.
+- **Original destination:** `get_original_dest()` reads `SO_ORIGINAL_DST` (v4) or
+  `IP6T_SO_ORIGINAL_DST` (v6); `server_addr()` works for both under TPROXY.
+- **Upstream spoofing:** `BindTo::set_ip_transparent(true)` with a v6 `addr` sets
+  `IPV6_TRANSPARENT` before binding the v6 source.
+
+Use the IPv6 iptables/routing equivalents on the host:
+
+```sh
+# forwarding (there is no rp_filter / accept_local to tweak for IPv6)
+sysctl -w net.ipv6.conf.all.forwarding=1
+
+# NAT / REDIRECT
+ip6tables -t nat -A PREROUTING -i eth0 -p tcp --dport 80 -j REDIRECT --to-ports 50080
+
+# TPROXY
+ip -6 rule add fwmark 1 lookup 100
+ip -6 route add local ::/0 dev lo table 100
+ip6tables -t mangle -A PREROUTING -i eth0 -p tcp --dport 80 \
+    -j TPROXY --on-port 50080 --tproxy-mark 0x1/0x1
+```
+
+> Note: the IPv4-only `rp_filter=0` / `accept_local=1` gotcha does not apply to
+> IPv6 (those sysctls don't exist for v6); IPv6 TPROXY works with just the
+> policy route above plus `forwarding=1`.
+
+## 6. Verifying your setup
 
 A ready-to-run, containerized functional test for all three code paths lives in
 [`docs/transparent-proxy/`](../transparent-proxy/README.md). It builds a small

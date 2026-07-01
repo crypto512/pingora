@@ -16,6 +16,24 @@ use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::os::unix::io::AsRawFd;
 
+// Raw IPV6_TRANSPARENT setsockopt (socket2 only exposes the v4 variant).
+fn set_ipv6_transparent(fd: std::os::unix::io::RawFd) -> std::io::Result<()> {
+    let on: libc::c_int = 1;
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IPV6,
+            libc::IPV6_TRANSPARENT,
+            &on as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 fn usage() -> ! {
     eprintln!(
         "usage:\n  \
@@ -78,9 +96,19 @@ fn proxy_nat(bind: &str) {
 // and read the original destination via `Session::server_addr()`.
 fn proxy_tproxy(bind: &str) {
     let addr: SocketAddr = bind.parse().expect("bad proxy addr");
-    let sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).expect("socket");
-    sock.set_ip_transparent_v4(true)
-        .expect("set IP_TRANSPARENT (needs CAP_NET_ADMIN)");
+    let v6 = addr.is_ipv6();
+    let domain = if v6 { Domain::IPV6 } else { Domain::IPV4 };
+    let sock = Socket::new(domain, Type::STREAM, Some(Protocol::TCP)).expect("socket");
+    if v6 {
+        // keep the families separate so the test binds a pure-v6 socket
+        sock.set_only_v6(true).expect("set IPV6_V6ONLY");
+        // socket2 only exposes set_ip_transparent_v4(); set IPV6_TRANSPARENT via
+        // raw setsockopt, exactly as pingora's apply_tcp_socket_options does.
+        set_ipv6_transparent(sock.as_raw_fd()).expect("set IPV6_TRANSPARENT (needs CAP_NET_ADMIN)");
+    } else {
+        sock.set_ip_transparent_v4(true)
+            .expect("set IP_TRANSPARENT (needs CAP_NET_ADMIN)");
+    }
     sock.set_reuse_address(true).expect("reuseaddr");
     sock.bind(&addr.into()).expect("tproxy bind");
     sock.listen(128).expect("listen");
