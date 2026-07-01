@@ -221,6 +221,40 @@ ip6tables -t mangle -A PREROUTING -i eth0 -p tcp --dport 80 \
 > IPv6 (those sysctls don't exist for v6); IPv6 TPROXY works with just the
 > policy route above plus `forwarding=1`.
 
+### Dual-stack `[::]` listeners
+
+A single listener bound to `[::]` with `IPV6_V6ONLY=0` (i.e. `ipv6_only` unset /
+`Some(false)`) intercepts **both** IPv4 and IPv6 TPROXY traffic. In the kernel
+`IP_TRANSPARENT` and `IPV6_TRANSPARENT` toggle the *same* `inet->transparent`
+socket flag, so pingora setting `IPV6_TRANSPARENT` on the v6 socket is enough to
+also transparently accept IPv4 (v4-mapped) connections — no separate v4 listener
+is required. Practical consequences:
+
+- You still need **both** `iptables` (v4) and `ip6tables` (v6) TPROXY rules, all
+  pointing at the same `--on-port`; the socket family is not what selects traffic,
+  the netfilter rules are.
+- For an intercepted IPv4 connection, `server_addr()` (and `getsockname`) returns
+  the original destination as an **IPv4-mapped** address, e.g.
+  `[::ffff:1.2.3.4]:80`. Normalize it back to `V4` if your logic expects a plain
+  IPv4 address:
+
+  ```rust
+  use std::net::{IpAddr, SocketAddr};
+  fn unmap(a: SocketAddr) -> SocketAddr {
+      match a {
+          SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
+              Some(v4) => SocketAddr::new(IpAddr::V4(v4), a.port()),
+              None => a,
+          },
+          v4 => v4,
+      }
+  }
+  ```
+
+- If you instead want strictly separate v4 and v6 listeners, set
+  `ipv6_only: Some(true)` on the `[::]` listener and add a second `0.0.0.0`
+  listener; each then reports native (non-mapped) addresses.
+
 ## 6. Verifying your setup
 
 A ready-to-run, containerized functional test for all three code paths lives in
@@ -236,5 +270,5 @@ docker run --rm --privileged \
   -v "$PWD/target/debug/transparent-proxy-test:/transparent-proxy-test:ro" \
   -v "$PWD/run.sh:/run.sh:ro" \
   debian:trixie-slim bash /run.sh
-# => 3 passed, 0 failed
+# => 7 passed, 0 failed   (NAT/TPROXY/upstream over IPv4 + IPv6, plus dual-stack)
 ```

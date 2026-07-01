@@ -116,5 +116,18 @@ echo "  client said:  ${conn:-<none>}"; echo "  backend said: ${peer:-<none>}"
 echo "$peer" | grep -q '^PEER=\[fd00::9\]:' && ok "IPv6 upstream saw spoofed source fd00::9" || no "IPv6 upstream source spoof ($peer / $conn)"
 teardown_topo; rm -f "$bout" "$cout"
 
+echo; echo "### TEST 7 (dual-stack): [::] listener w/ only IPV6_TRANSPARENT intercepts IPv4 TPROXY"
+setup_topo
+ip netns exec rtr ip rule add fwmark 1 lookup 100
+ip netns exec rtr ip route add local 0.0.0.0/0 dev lo table 100
+ip netns exec rtr iptables -t mangle -A PREROUTING -i veth-r -p tcp -d 1.2.3.4 --dport 80 -j TPROXY --on-port 50080 --tproxy-mark 0x1/0x1
+out=$(mktemp)
+ip netns exec rtr $BIN proxy-tproxy-dual '[::]:50080' >"$out" 2>/dev/null &
+wait_ready "$out" && client_connect 1.2.3.4 80   # IPv4 client into the dual-stack v6 socket
+sleep 0.4
+got=$(grep ORIGDST "$out" | head -1); echo "  proxy said: ${got:-<none>}"
+[ "$got" = "ORIGDST=[::ffff:1.2.3.4]:80" ] && ok "dual-stack v6 socket intercepts IPv4 TPROXY (v4-mapped)" || no "dual-stack IPv4 intercept ($got)"
+teardown_topo; rm -f "$out"
+
 echo; echo "### RESULT: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
