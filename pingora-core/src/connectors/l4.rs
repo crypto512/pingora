@@ -88,6 +88,24 @@ impl BindTo {
         self.fallback = fallback
     }
 
+    /// Enable `IP_TRANSPARENT` on the upstream socket before binding, so it may
+    /// bind a non-local source address (e.g. the client's) for fully transparent
+    /// (source-spoofing) proxying. Pair this with [`BindTo::addr`] set to the
+    /// source address to spoof, and add a return route for it
+    /// (`ip route add local <src> dev lo`). Requires `CAP_NET_ADMIN`. Linux only.
+    #[cfg(target_os = "linux")]
+    pub fn set_ip_transparent(&mut self, transparent: bool) {
+        self.ip_transparent = transparent
+    }
+
+    /// Set `SO_MARK` on the upstream socket for policy routing, e.g. to steer
+    /// spoofed-source upstream traffic through a dedicated routing table.
+    /// Requires `CAP_NET_ADMIN`. Linux only.
+    #[cfg(target_os = "linux")]
+    pub fn set_so_mark(&mut self, mark: Option<u32>) {
+        self.so_mark = mark
+    }
+
     /// Configured bind port range
     pub fn port_range(&self) -> Option<(u16, u16)> {
         self.port_range
