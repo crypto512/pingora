@@ -54,6 +54,7 @@ fn main() {
         "backend" => backend(&args[2]),
         "proxy-nat" => proxy_nat(&args[2]),
         "proxy-tproxy" => proxy_tproxy(&args[2]),
+        "proxy-tproxy-dual" => proxy_tproxy_dual(&args[2]),
         "upstream-spoof" => upstream_spoof(&args[2], &args[3]),
         _ => usage(),
     }
@@ -117,6 +118,25 @@ fn proxy_tproxy(bind: &str) {
     // local_addr() == original destination that the client dialed
     let local = conn.local_addr().expect("getsockname");
     let local = local.as_socket().expect("inet");
+    println!("ORIGDST={local}");
+}
+
+// Dual-stack TPROXY: a single `[::]` listener with IPV6_V6ONLY=0 and only
+// IPV6_TRANSPARENT set. Because the kernel's IP_TRANSPARENT and IPV6_TRANSPARENT
+// setsockopts both toggle the same `inet->transparent` socket flag, this one
+// socket also intercepts IPv4 (v4-mapped) TPROXY traffic. getsockname then
+// returns the original v4 destination as `::ffff:a.b.c.d`.
+fn proxy_tproxy_dual(bind: &str) {
+    let addr: SocketAddr = bind.parse().expect("bad proxy addr");
+    let sock = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP)).expect("socket");
+    sock.set_only_v6(false).expect("enable dual stack");
+    set_ipv6_transparent(sock.as_raw_fd()).expect("set IPV6_TRANSPARENT (needs CAP_NET_ADMIN)");
+    sock.set_reuse_address(true).expect("reuseaddr");
+    sock.bind(&addr.into()).expect("tproxy bind");
+    sock.listen(128).expect("listen");
+    println!("READY");
+    let (conn, _peer) = sock.accept().expect("tproxy accept");
+    let local = conn.local_addr().expect("getsockname").as_socket().expect("inet");
     println!("ORIGDST={local}");
 }
 
