@@ -1,0 +1,20 @@
+# Standalone test harness for transparent-proxy socket options. Kept out of the
+# main workspace (own empty [workspace] table) so it doesn't affect normal builds.
+# See ./README.md and ../user_guide/transparent_proxy.md.
+[package]
+name = "transparent-proxy-test"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+pingora-core = { path = "../../pingora-core" }
+tokio = { version = "1", features = ["full"] }
+socket2 = { version = "0.6", features = ["all"] }
+libc = "0.2"
+
+[[bin]]
+name = "transparent-proxy-test"
+path = "src/main.rs"
+
+[workspace]
