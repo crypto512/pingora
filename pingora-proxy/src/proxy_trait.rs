@@ -448,13 +448,16 @@ pub trait ProxyHttp {
     ///
     /// This function will be called every time a piece of response body is received. The `body` is
     /// **not the entire response body**.
-    fn upstream_response_body_filter(
+    async fn upstream_response_body_filter(
         &self,
         _session: &mut Session,
         _body: &mut Option<Bytes>,
         _end_of_stream: bool,
         _ctx: &mut Self::CTX,
-    ) -> Result<Option<Duration>> {
+    ) -> Result<Option<Duration>>
+    where
+        Self::CTX: Send + Sync,
+    {
         Ok(None)
     }
 
@@ -469,7 +472,11 @@ pub trait ProxyHttp {
     }
 
     /// Similar to [Self::response_filter()] but for response body chunks
-    fn response_body_filter(
+    ///
+    /// This is `async` (unlike a stock Pingora build) so a filter can await work
+    /// — e.g. submit a buffered response body to an external scanner — before the
+    /// chunk is forwarded downstream. Fork patch for streamscope RESPMOD.
+    async fn response_body_filter(
         &self,
         _session: &mut Session,
         _body: &mut Option<Bytes>,
