@@ -502,6 +502,21 @@ pub struct Session {
     upstream_write_pending_time: Duration,
     /// Flag that is set when the shutdown process has begun.
     shutdown_flag: Arc<AtomicBool>,
+    /// streamscope RESPMOD block-page support: when a `response_filter` requests
+    /// it, the downstream response HEADER is held (not written) until the response
+    /// body has been fully accumulated and inspected by `response_body_filter`. On
+    /// release the held header — or a `response_header_override` supplied by the
+    /// body filter — is written ahead of the (possibly replaced) body. This lets a
+    /// filter turn an infected download's `200` into a real `403` block page
+    /// instead of aborting the stream. Off by default => zero behavior change.
+    hold_response_header: bool,
+    /// The stashed original downstream response header (fully filtered), retained
+    /// across upstream task batches while `hold_response_header` is set.
+    held_response_header: Option<Box<ResponseHeader>>,
+    /// A replacement response header supplied by `response_body_filter` (e.g. the
+    /// `403` block-page header). Takes precedence over `held_response_header` on
+    /// release.
+    response_header_override: Option<Box<ResponseHeader>>,
 }
 
 impl Session {
@@ -527,7 +542,97 @@ impl Session {
             upstream_body_bytes_received: 0,
             upstream_write_pending_time: Duration::ZERO,
             shutdown_flag,
+            hold_response_header: false,
+            held_response_header: None,
+            response_header_override: None,
         }
+    }
+
+    /// streamscope RESPMOD block-page support. Request (or clear) holding the
+    /// downstream response header until the response body is fully inspected.
+    ///
+    /// Call this from `ProxyHttp::response_filter`. When `hold` is true, the
+    /// response header is stashed instead of written; `response_body_filter` can
+    /// then buffer/withhold the body (`*body = None`) and, at end-of-stream, either
+    /// release it unchanged (clean) or call [`Session::override_response_header`]
+    /// to serve a replacement (e.g. a `403` block page) with a replacement body.
+    /// Setting it (either value) resets any header held from a prior response, so a
+    /// reused (keep-alive) connection never leaks state between requests.
+    pub fn set_hold_response_header(&mut self, hold: bool) {
+        self.hold_response_header = hold;
+        self.held_response_header = None;
+        self.response_header_override = None;
+    }
+
+    /// Supply a replacement downstream response header, used in place of the held
+    /// upstream header when the response is released. Intended for
+    /// `response_body_filter` to turn an infected download into a block-page
+    /// response. No effect unless header holding was enabled via
+    /// [`Session::set_hold_response_header`].
+    pub fn override_response_header(&mut self, header: Box<ResponseHeader>) {
+        self.response_header_override = Some(header);
+    }
+
+    /// Apply held-response-header logic to one batch of downstream tasks, in place,
+    /// right before they are written downstream. No-op unless holding is active.
+    ///
+    /// While holding: a `Header` task is stashed (and dropped from the batch) so it
+    /// is not written yet; withheld empty `Body` chunks are dropped. When the batch
+    /// carries real body bytes or the end-of-stream marker, the response is
+    /// released: the override header (if any) else the held header is prepended, and
+    /// holding is turned off so any remaining chunks stream through untouched. A
+    /// bodyless held header (`end` on the header task) is released immediately.
+    pub(crate) fn handle_held_response_header(&mut self, tasks: &mut Vec<HttpTask>) {
+        if !self.hold_response_header {
+            return;
+        }
+        let mut out: Vec<HttpTask> = Vec::with_capacity(tasks.len() + 1);
+        // `release` = write the (held/override) header in this batch. `header_ends`
+        // = the response is bodyless (the header task itself carried end-of-stream).
+        let mut release = false;
+        let mut header_ends = false;
+        for task in tasks.drain(..) {
+            match task {
+                HttpTask::Header(header, end) => {
+                    // Stash the already-filtered header; do not write it yet.
+                    self.held_response_header = Some(header);
+                    if end {
+                        release = true;
+                        header_ends = true;
+                    }
+                }
+                HttpTask::Body(data, end) => {
+                    let has_data = data.as_ref().is_some_and(|b| !b.is_empty());
+                    if has_data || end {
+                        // Real body bytes (or stream end): release the header ahead
+                        // of this body.
+                        release = true;
+                        out.push(HttpTask::Body(data, end));
+                    }
+                    // else: a withheld empty chunk — drop it (write nothing).
+                }
+                other => {
+                    // Trailer/Done/Failed: ensure the header precedes them.
+                    release = true;
+                    out.push(other);
+                }
+            }
+        }
+        if release {
+            self.hold_response_header = false;
+            // The body filter's override (e.g. a 403 block page) wins over the
+            // original upstream header.
+            if let Some(header) = self
+                .response_header_override
+                .take()
+                .or_else(|| self.held_response_header.take())
+            {
+                out.insert(0, HttpTask::Header(header, header_ends));
+            }
+        }
+        // else: only a header was seen (no body yet) — keep holding; the stashed
+        // header is retained for a later batch.
+        *tasks = out;
     }
 
     /// Create a new [Session] from the given [Stream]

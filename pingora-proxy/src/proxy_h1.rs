@@ -355,6 +355,11 @@ where
             return Ok(None);
         }
 
+        // streamscope RESPMOD: hold the response header until the body is inspected
+        // (no-op unless a response_filter requested it). Must run just before the
+        // write, so the body filter has already set any override header this batch.
+        session.handle_held_response_header(&mut filtered_tasks);
+
         let response_done = session.write_response_tasks(filtered_tasks).await?;
 
         Ok(Some(response_done))
