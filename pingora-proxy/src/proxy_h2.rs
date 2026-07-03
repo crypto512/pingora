@@ -348,6 +348,23 @@ where
             return Ok(None);
         }
 
+        // streamscope sink mode: the downstream response was finished early
+        // (`Session::finish_downstream_response_early`, END_STREAM already sent).
+        // The tasks above already ran through all filters so the app keeps
+        // accumulating the upstream body; write nothing further downstream.
+        // Upstream failures still abort (checked before `is_end`, which is also
+        // true for `Failed`); the response is done at upstream end-of-stream.
+        if session.downstream_finished_early() {
+            let mut response_done = false;
+            for t in filtered_tasks {
+                if let HttpTask::Failed(e) = t {
+                    return Err(e);
+                }
+                response_done |= t.is_end();
+            }
+            return Ok(Some(response_done));
+        }
+
         // streamscope RESPMOD: hold the response header until the body is inspected
         // (no-op unless a response_filter requested it). Must run just before the
         // write, so the body filter has already set any override header this batch.
@@ -451,20 +468,40 @@ where
                         Err(e) => {
                             let wait_for_cache_fill = (!serve_from_cache.is_on() && support_cache_partial_read)
                                 || serve_from_cache.is_miss();
-                            if wait_for_cache_fill {
+                            // streamscope sink mode: the client already received its
+                            // (synthetic, early-finished) response — a downstream
+                            // RST_STREAM/cancel must not abort the upstream drain.
+                            // Same continuation as the cache-fill branch.
+                            let early_finished = session.downstream_finished_early();
+                            if wait_for_cache_fill || early_finished {
                                 // ignore downstream error so that upstream can continue to write cache
                                 downstream_state.to_errored();
+                                let log_ctx = if early_finished {
+                                    ProxyWarnLogContext::DownstreamEarlyFinish
+                                } else {
+                                    ProxyWarnLogContext::DownstreamCache
+                                };
                                 if !self.inner.suppress_proxy_warn_log(
                                     session,
                                     ctx,
                                     &e,
-                                    ProxyWarnLogContext::DownstreamCache,
+                                    log_ctx,
                                 ) {
-                                    warn!(
-                                        "Downstream Error ignored during caching: {}, {}",
-                                        e,
-                                        self.inner.request_summary(session, ctx)
-                                    );
+                                    if early_finished {
+                                        // Expected: the stream already ended with
+                                        // END_STREAM; the client leaving is normal.
+                                        debug!(
+                                            "Downstream closed after early finish; draining upstream: {}, {}",
+                                            e,
+                                            self.inner.request_summary(session, ctx)
+                                        );
+                                    } else {
+                                        warn!(
+                                            "Downstream Error ignored during caching: {}, {}",
+                                            e,
+                                            self.inner.request_summary(session, ctx)
+                                        );
+                                    }
                                 }
                                 // This will not be treated as a final error, but we should signal to
                                 // downstream session regardless
@@ -702,7 +739,11 @@ where
             }
         }
 
-        let mut reuse_downstream = !downstream_state.is_errored();
+        // streamscope sink mode: the early-finished synthetic response already
+        // ended this h2 stream (END_STREAM); don't run the finish tail again.
+        // Sibling streams on the connection are unaffected.
+        let mut reuse_downstream =
+            !downstream_state.is_errored() && !session.downstream_finished_early();
         if reuse_downstream {
             match session.as_mut().finish_body().await {
                 Ok(_) => {

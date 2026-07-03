@@ -255,6 +255,32 @@ pub fn suppress_proxy_warn_log_calls() -> usize {
     SUPPRESS_PROXY_WARN_LOG_CALLS.load(Ordering::Relaxed)
 }
 
+/// streamscope sink-mode (downstream early-finish) test support: the synthetic
+/// page `response_body_filter` serves when a request carries `x-early-finish`.
+pub const EARLY_FINISH_PAGE: &[u8] = b"<html>scanning, please wait</html>";
+
+/// Per-test drain accounting for early-finish requests, keyed by the
+/// `x-early-finish` header value: (bytes seen by the body filter after the
+/// early finish, end-of-stream reached).
+static EARLY_FINISH_DRAIN: Lazy<std::sync::Mutex<HashMap<String, (usize, bool)>>> =
+    Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+
+pub fn early_finish_drained(id: &str) -> (usize, bool) {
+    EARLY_FINISH_DRAIN
+        .lock()
+        .unwrap()
+        .get(id)
+        .copied()
+        .unwrap_or((0, false))
+}
+
+fn record_early_finish_drain(id: String, bytes: usize, end_of_stream: bool) {
+    let mut map = EARLY_FINISH_DRAIN.lock().unwrap();
+    let entry = map.entry(id).or_insert((0, false));
+    entry.0 += bytes;
+    entry.1 |= end_of_stream;
+}
+
 #[async_trait]
 impl ProxyHttp for ExampleProxyHttp {
     type CTX = CTX;
@@ -356,6 +382,48 @@ impl ProxyHttp for ExampleProxyHttp {
             *body = None;
         }
         Ok(())
+    }
+
+    async fn response_body_filter(
+        &self,
+        session: &mut Session,
+        body: &mut Option<bytes::Bytes>,
+        end_of_stream: bool,
+        _ctx: &mut Self::CTX,
+    ) -> Result<Option<Duration>> {
+        // streamscope sink-mode test hook: on the first mid-stream body chunk of a
+        // request tagged `x-early-finish: <test-id>`, finish the downstream with a
+        // complete synthetic page and keep draining the upstream through this
+        // filter, accounting the drained bytes per test id.
+        let Some(id) = session
+            .req_header()
+            .headers
+            .get("x-early-finish")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+        else {
+            return Ok(None);
+        };
+        if !session.downstream_finished_early()
+            && !end_of_stream
+            && body.as_ref().is_some_and(|b| !b.is_empty())
+        {
+            let mut resp = ResponseHeader::build(200, Some(3))?;
+            resp.insert_header("content-type", "text/html")?;
+            resp.insert_header("content-length", EARLY_FINISH_PAGE.len().to_string())?;
+            resp.insert_header("connection", "close")?;
+            session
+                .finish_downstream_response_early(
+                    Box::new(resp),
+                    bytes::Bytes::from_static(EARLY_FINISH_PAGE),
+                )
+                .await?;
+        }
+        if session.downstream_finished_early() {
+            let n = body.as_ref().map_or(0, |b| b.len());
+            record_early_finish_drain(id, n, end_of_stream);
+        }
+        Ok(None)
     }
 
     async fn upstream_request_filter(

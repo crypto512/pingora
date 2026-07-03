@@ -403,10 +403,11 @@ where
                     .await?;
                 None
             }
-            HttpTask::Body(data, eos) | HttpTask::UpgradedBody(data, eos) => self
-                .inner
-                .upstream_response_body_filter(session, data, *eos, ctx)
-                .await?,
+            HttpTask::Body(data, eos) | HttpTask::UpgradedBody(data, eos) => {
+                self.inner
+                    .upstream_response_body_filter(session, data, *eos, ctx)
+                    .await?
+            }
             HttpTask::Trailer(Some(trailers)) => {
                 self.inner
                     .upstream_response_trailer_filter(session, trailers, ctx)?;
@@ -517,6 +518,15 @@ pub struct Session {
     /// `403` block-page header). Takes precedence over `held_response_header` on
     /// release.
     response_header_override: Option<Box<ResponseHeader>>,
+    /// streamscope patience support ("sink mode"): set once the app has finished
+    /// the downstream response early with a complete synthetic response
+    /// ([`Session::finish_downstream_response_early`]). While set, the proxy
+    /// drivers keep reading the upstream response and keep running the response
+    /// body filters (so the app can keep accumulating the body), but write
+    /// nothing further downstream, tolerate downstream read errors the same way
+    /// the cache-fill continuation does, and mark the downstream connection
+    /// non-reusable. Off by default => zero behavior change.
+    downstream_finished_early: bool,
 }
 
 impl Session {
@@ -545,6 +555,7 @@ impl Session {
             hold_response_header: false,
             held_response_header: None,
             response_header_override: None,
+            downstream_finished_early: false,
         }
     }
 
@@ -556,12 +567,67 @@ impl Session {
     /// then buffer/withhold the body (`*body = None`) and, at end-of-stream, either
     /// release it unchanged (clean) or call [`Session::override_response_header`]
     /// to serve a replacement (e.g. a `403` block page) with a replacement body.
-    /// Setting it (either value) resets any header held from a prior response, so a
-    /// reused (keep-alive) connection never leaks state between requests.
+    /// Setting it (either value) resets any header held from a prior response —
+    /// and any early-finish (sink mode) state — so a reused (keep-alive)
+    /// connection never leaks state between requests.
     pub fn set_hold_response_header(&mut self, hold: bool) {
         self.hold_response_header = hold;
         self.held_response_header = None;
         self.response_header_override = None;
+        self.downstream_finished_early = false;
+    }
+
+    /// streamscope patience support: whether the downstream response was already
+    /// finished early with a synthetic response (sink mode). See
+    /// [`Session::finish_downstream_response_early`].
+    pub fn downstream_finished_early(&self) -> bool {
+        self.downstream_finished_early
+    }
+
+    /// Finish the downstream response NOW with a complete synthetic response,
+    /// then enter sink mode: subsequent upstream tasks still run through the
+    /// response body filters (so an inspecting app keeps accumulating the body),
+    /// but nothing further is written downstream; the drivers keep pumping the
+    /// upstream to end-of-stream (the cache-fill continuation idiom) and report
+    /// the downstream connection as non-reusable.
+    ///
+    /// Intended for `ProxyHttp::response_body_filter` on a withheld (held-header)
+    /// response: e.g. replace a slow, still-downloading body with a "please
+    /// wait" interstitial while the transfer keeps buffering for inspection.
+    /// Consumes/clears any held-header state — the synthetic response replaces
+    /// the (never-written) upstream header; a same-batch upstream `Header` task
+    /// is discarded by the drivers' sink branch, so exactly one response reaches
+    /// the wire. Works on both h1 (header + body finished in one write) and h2
+    /// (DATA with END_STREAM).
+    ///
+    /// The caller should set `Content-Length` (the body is written as one final
+    /// chunk) and, for h1 clients, `Connection: close` — the session task stays
+    /// busy draining the upstream, so a pipelined keep-alive request would not
+    /// be read until the drain completes.
+    ///
+    /// Sink mode is entered even if the write fails (a broken downstream must
+    /// not receive any later writes either); the error is still returned so the
+    /// caller can abort/clean up its own state.
+    pub async fn finish_downstream_response_early(
+        &mut self,
+        header: Box<ResponseHeader>,
+        body: Bytes,
+    ) -> Result<()> {
+        // Discard any held/override header state; nothing upstream-originated
+        // may be written after this point.
+        self.set_hold_response_header(false);
+        let res = self
+            .write_response_tasks(vec![
+                HttpTask::Header(header, false),
+                HttpTask::Body(Some(body), true),
+            ])
+            .await;
+        // Note: the `bool` (response done) from `write_response_tasks` is
+        // deliberately dropped — it must not feed the driver's response state,
+        // which tracks the *upstream* response and must keep the drain loop
+        // running until upstream end-of-stream.
+        self.downstream_finished_early = true;
+        res.map(|_| ())
     }
 
     /// Supply a replacement downstream response header, used in place of the held
@@ -1703,5 +1769,34 @@ where
             service.set_runtime_opts_override(runtime_opts_override);
         }
         service
+    }
+}
+
+#[cfg(test)]
+mod session_state_tests {
+    use super::*;
+
+    fn mock_session() -> Session {
+        // No queued IO actions: this test only exercises Session state flags and
+        // never reads/writes the stream (tokio-test panics on unconsumed actions).
+        let mock_io = tokio_test::io::Builder::new().build();
+        Session::new_h1(Box::new(mock_io) as pingora_core::protocols::Stream)
+    }
+
+    /// streamscope sink mode: `set_hold_response_header` (called for every
+    /// response once a RESPMOD-style filter is configured) must clear the
+    /// early-finish flag so a reused connection never leaks sink state.
+    #[tokio::test]
+    async fn set_hold_response_header_resets_early_finish_state() {
+        let mut session = mock_session();
+        assert!(!session.downstream_finished_early());
+
+        session.downstream_finished_early = true;
+        session.set_hold_response_header(false);
+        assert!(!session.downstream_finished_early());
+
+        session.downstream_finished_early = true;
+        session.set_hold_response_header(true);
+        assert!(!session.downstream_finished_early());
     }
 }
