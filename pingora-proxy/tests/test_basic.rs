@@ -1155,9 +1155,9 @@ async fn test_103_die() {
 // keep flowing through the body filters (the sink drain) until upstream EOS.
 
 /// Poll the per-test drain accounting until the upstream reached end-of-stream
-/// (or a generous deadline expires — the origin takes ~3s to finish).
+/// (or a generous deadline expires — the origin takes ~6s to finish).
 async fn wait_early_finish_drain_complete(id: &str) -> (usize, bool) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
         let (n, eos) = early_finish_drained(id);
         if eos || std::time::Instant::now() > deadline {
@@ -1178,11 +1178,17 @@ async fn test_downstream_early_finish_h1() {
         // identity: the test app enables compression when the client accepts
         // gzip, which would change the byte count the drain accounting sees
         .header("accept-encoding", "identity")
+        // 2s between origin chunks: a wide margin for the mid-stream asserts
+        .header("x-set-sleep", "2")
         .send()
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(res.headers()["content-type"], "text/html");
+    // set_keepalive(None) inside the API must surface as `Connection: close` —
+    // a keep-alive client would otherwise pipeline its next request (the
+    // interstitial's poll!) into the drain, where it would sit unread.
+    assert_eq!(res.headers()["connection"], "close");
     let body = res.bytes().await.unwrap();
     // The client got the complete synthetic page, not the origin body.
     assert_eq!(body.as_ref(), EARLY_FINISH_PAGE);
@@ -1307,6 +1313,7 @@ async fn test_downstream_early_finish_h2_upstream() {
         .header("x-early-finish", id)
         .header("x-h2", "true")
         .header("accept-encoding", "identity")
+        .header("x-set-sleep", "2")
         .send()
         .await
         .unwrap();
@@ -1323,5 +1330,44 @@ async fn test_downstream_early_finish_h2_upstream() {
 
     let (drained, eos) = wait_early_finish_drain_complete(id).await;
     assert_eq!(drained, 12);
+    assert!(eos);
+}
+
+#[tokio::test]
+async fn test_downstream_early_finish_h2_rst_mid_drain() {
+    init();
+    let id = "early_finish_h2_rst";
+
+    let tcp = TcpStream::connect("127.0.0.1:6146").await.unwrap();
+    let (mut h2c, connection) = client::handshake(tcp).await.unwrap();
+    let driver = tokio::spawn(async move {
+        // Ignore the connection error our abort() below provokes.
+        let _ = connection.await;
+    });
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("http://127.0.0.1:6146/slow_body/")
+        .header("x-early-finish", id)
+        .header("x-set-sleep", "2")
+        .body(())
+        .unwrap();
+    let (response, _) = h2c.send_request(request, true).unwrap();
+    let (head, mut body) = response.await.unwrap().into_parts();
+    assert_eq!(head.status.as_u16(), 200);
+    let mut got = Vec::new();
+    while let Some(chunk) = body.data().await {
+        got.extend_from_slice(&chunk.unwrap());
+    }
+    assert_eq!(got.as_slice(), EARLY_FINISH_PAGE);
+
+    // Tear the whole h2 connection down abruptly while the origin is still
+    // streaming: the driver task owns the TcpStream, so aborting it drops the
+    // socket without GOAWAY. The server-side drain must tolerate it.
+    driver.abort();
+    drop(h2c);
+
+    let (drained, eos) = wait_early_finish_drain_complete(id).await;
+    assert_eq!(drained, 12, "abrupt h2 teardown must not abort the drain");
     assert!(eos);
 }
