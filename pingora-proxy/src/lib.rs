@@ -591,28 +591,61 @@ impl Session {
     /// upstream to end-of-stream (the cache-fill continuation idiom) and report
     /// the downstream connection as non-reusable.
     ///
-    /// Intended for `ProxyHttp::response_body_filter` on a withheld (held-header)
-    /// response: e.g. replace a slow, still-downloading body with a "please
-    /// wait" interstitial while the transfer keeps buffering for inspection.
-    /// Consumes/clears any held-header state — the synthetic response replaces
-    /// the (never-written) upstream header; a same-batch upstream `Header` task
-    /// is discarded by the drivers' sink branch, so exactly one response reaches
-    /// the wire. Works on both h1 (header + body finished in one write) and h2
-    /// (DATA with END_STREAM).
+    /// Intended for `ProxyHttp::response_body_filter` on a **withheld
+    /// (held-header)** response: e.g. replace a slow, still-downloading body with
+    /// a "please wait" interstitial while the transfer keeps buffering for
+    /// inspection. Consumes/clears any held-header state — the synthetic response
+    /// replaces the (never-written) upstream header; a same-batch upstream
+    /// `Header` task is discarded by the drivers' sink branch, so exactly one
+    /// response reaches the wire. Works on both h1 (header + body finished in one
+    /// write) and h2 (DATA with END_STREAM).
+    ///
+    /// **Errors without writing** (and without entering sink mode) when the
+    /// downstream response header was already written — calling this on a
+    /// non-held response after the header hit the wire would otherwise splice the
+    /// synthetic body into the origin's framing — or when the session was
+    /// upgraded (a synthetic response cannot be injected into a tunnel; the h1
+    /// upgraded body writer would panic).
     ///
     /// The caller should set `Content-Length` (the body is written as one final
-    /// chunk) and, for h1 clients, `Connection: close` — the session task stays
-    /// busy draining the upstream, so a pipelined keep-alive request would not
-    /// be read until the drain completes.
+    /// chunk). Downstream keep-alive is disabled here (`set_keepalive(None)`), so
+    /// the h1 `Connection` header rewrite advertises `close` — the session task
+    /// stays busy draining the upstream, and a keep-alive client pipelining its
+    /// next request (e.g. the interstitial's refresh poll) would otherwise hang
+    /// unread until the drain completes.
     ///
-    /// Sink mode is entered even if the write fails (a broken downstream must
-    /// not receive any later writes either); the error is still returned so the
-    /// caller can abort/clean up its own state.
+    /// Not for serve-from-cache sessions (streamscope runs cache-less): the
+    /// cache-serving write branches do not consult the sink flag.
+    ///
+    /// Sink mode extends the request task's lifetime to upstream end-of-stream,
+    /// even after the client disconnects — the upstream peer's read/write
+    /// timeouts are the drain's bound; always configure them.
+    ///
+    /// Sink mode is entered even if the write itself fails (a broken downstream
+    /// must not receive any later writes either); the error is still returned so
+    /// the caller can abort/clean up its own state.
     pub async fn finish_downstream_response_early(
         &mut self,
         header: Box<ResponseHeader>,
         body: Bytes,
     ) -> Result<()> {
+        if self.downstream_session.was_upgraded() {
+            return Error::e_explain(
+                InternalError,
+                "finish_downstream_response_early: session was upgraded (tunnel)",
+            );
+        }
+        if self.downstream_session.response_written().is_some() {
+            return Error::e_explain(
+                InternalError,
+                "finish_downstream_response_early: response header already sent downstream",
+            );
+        }
+        // Close the downstream after this response: h1's Connection-header
+        // rewrite follows session keepalive, so without this a keep-alive
+        // client would be told `keep-alive` and pipeline its next request into
+        // the drain (where it would sit unread).
+        self.downstream_session.set_keepalive(None);
         // Discard any held/override header state; nothing upstream-originated
         // may be written after this point.
         self.set_hold_response_header(false);

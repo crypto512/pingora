@@ -364,6 +364,13 @@ impl ProxyHttp for ExampleProxyHttp {
         upstream_response: &mut ResponseHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
+        // Early-finish (sink mode) requests use the documented hold-then-finish
+        // flow: the upstream response header is HELD (never written) so the body
+        // filter can replace the response with the synthetic page mid-stream
+        // regardless of how header/body tasks batch together.
+        if session.req_header().headers.contains_key("x-early-finish") {
+            session.set_hold_response_header(true);
+        }
         response_filter_common(session, upstream_response, ctx)
     }
 
