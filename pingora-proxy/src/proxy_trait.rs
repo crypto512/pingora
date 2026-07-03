@@ -36,6 +36,12 @@ pub enum ProxyWarnLogContext {
     UpstreamRetry,
     /// A downstream error was ignored so cache fill could continue.
     DownstreamCache,
+    /// A downstream error was ignored because the downstream response was
+    /// already finished early ([`Session::finish_downstream_response_early`])
+    /// and the upstream is being drained (streamscope sink mode).
+    ///
+    /// [`Session::finish_downstream_response_early`]: crate::Session::finish_downstream_response_early
+    DownstreamEarlyFinish,
 }
 
 /// The interface to control the HTTP proxy
