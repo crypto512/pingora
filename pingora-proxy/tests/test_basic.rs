@@ -29,7 +29,8 @@ use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 
 use utils::server_utils::{
-    init, reset_suppress_proxy_warn_log_calls, suppress_proxy_warn_log_calls,
+    early_finish_drained, init, reset_suppress_proxy_warn_log_calls, suppress_proxy_warn_log_calls,
+    EARLY_FINISH_PAGE,
 };
 
 fn is_specified_port(port: u16) -> bool {
@@ -1141,4 +1142,186 @@ async fn test_103_die() {
     init();
     let res = reqwest::get("http://127.0.0.1:6147/103-die").await.unwrap();
     assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+}
+
+// ---- streamscope sink mode (Session::finish_downstream_response_early) ----
+//
+// The `x-early-finish: <test-id>` request header makes the test app's
+// `response_body_filter` (utils/server_utils.rs) finish the downstream with the
+// synthetic EARLY_FINISH_PAGE on the first mid-stream body chunk and account
+// every drained byte per test id. The origin `/slow_body/` endpoint streams
+// "hello " + "world" + "!" (12 bytes) with a 1s pause before each piece, so the
+// page is written while ~6 of 12 bytes have arrived — the remaining bytes must
+// keep flowing through the body filters (the sink drain) until upstream EOS.
+
+/// Poll the per-test drain accounting until the upstream reached end-of-stream
+/// (or a generous deadline expires — the origin takes ~3s to finish).
+async fn wait_early_finish_drain_complete(id: &str) -> (usize, bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let (n, eos) = early_finish_drained(id);
+        if eos || std::time::Instant::now() > deadline {
+            return (n, eos);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test]
+async fn test_downstream_early_finish_h1() {
+    init();
+    let id = "early_finish_h1";
+
+    let res = reqwest::Client::new()
+        .get("http://127.0.0.1:6147/slow_body/")
+        .header("x-early-finish", id)
+        // identity: the test app enables compression when the client accepts
+        // gzip, which would change the byte count the drain accounting sees
+        .header("accept-encoding", "identity")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers()["content-type"], "text/html");
+    let body = res.bytes().await.unwrap();
+    // The client got the complete synthetic page, not the origin body.
+    assert_eq!(body.as_ref(), EARLY_FINISH_PAGE);
+
+    // The page arrived mid-stream: the origin (3s total) is still sending.
+    let (drained, eos) = early_finish_drained(id);
+    assert!(
+        drained < 12,
+        "page should arrive mid-stream, drained={drained}"
+    );
+    assert!(!eos, "page should arrive before upstream end-of-stream");
+
+    // The sink drain keeps running the body filters to upstream EOS.
+    let (drained, eos) = wait_early_finish_drain_complete(id).await;
+    assert_eq!(
+        drained, 12,
+        "the full upstream body must flow through the filters"
+    );
+    assert!(eos, "the drain must reach upstream end-of-stream");
+}
+
+#[tokio::test]
+async fn test_downstream_early_finish_h1_client_close() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    init();
+    let id = "early_finish_h1_close";
+
+    let mut tcp = TcpStream::connect("127.0.0.1:6147").await.unwrap();
+    tcp.write_all(
+        format!("GET /slow_body/ HTTP/1.1\r\nHost: test\r\nx-early-finish: {id}\r\n\r\n")
+            .as_bytes(),
+    )
+    .await
+    .unwrap();
+
+    // Read until the full synthetic page arrived (headers + body).
+    let mut got = Vec::new();
+    let mut buf = vec![0u8; 4096];
+    while !got
+        .windows(EARLY_FINISH_PAGE.len())
+        .any(|w| w == EARLY_FINISH_PAGE)
+    {
+        let n = tcp.read(&mut buf).await.unwrap();
+        assert!(
+            n > 0,
+            "connection closed before the early-finish page arrived"
+        );
+        got.extend_from_slice(&buf[..n]);
+    }
+    // The client walks away while the origin is still streaming: the driver
+    // must tolerate the downstream close (cache-fill idiom) and keep draining.
+    drop(tcp);
+
+    let (drained, eos) = wait_early_finish_drain_complete(id).await;
+    assert_eq!(
+        drained, 12,
+        "client close must not abort the upstream drain"
+    );
+    assert!(eos);
+}
+
+#[tokio::test]
+async fn test_downstream_early_finish_h2_downstream() {
+    init();
+    let id = "early_finish_h2_down";
+
+    // h2c downstream (port 6146), h1 upstream: the early finish must end the h2
+    // stream with END_STREAM so the client completes cleanly.
+    let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+        .http2_only(true)
+        .build_http::<http_body_util::Empty<Bytes>>();
+
+    let mut req = http::Request::builder()
+        .uri("http://127.0.0.1:6146/slow_body/")
+        .body(http_body_util::Empty::<Bytes>::new())
+        .unwrap();
+    req.headers_mut().insert(
+        "x-early-finish",
+        http::HeaderValue::from_static("early_finish_h2_down"),
+    );
+    let res = client.request(req).await.unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::OK);
+    assert_eq!(res.version(), reqwest::Version::HTTP_2);
+    let body = res.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(body.as_ref(), EARLY_FINISH_PAGE);
+
+    let (drained, eos) = early_finish_drained(id);
+    assert!(
+        drained < 12,
+        "page should arrive mid-stream, drained={drained}"
+    );
+    assert!(!eos);
+
+    let (drained, eos) = wait_early_finish_drain_complete(id).await;
+    assert_eq!(drained, 12);
+    assert!(eos);
+
+    // No cross-request state leak: a normal request through the same client
+    // (same or fresh h2 connection) streams the origin body untouched.
+    let mut req2 = http::Request::builder()
+        .uri("http://127.0.0.1:6146/slow_body/")
+        .body(http_body_util::Empty::<Bytes>::new())
+        .unwrap();
+    req2.headers_mut()
+        .insert("x-set-sleep", http::HeaderValue::from_static("0"));
+    let res2 = client.request(req2).await.unwrap();
+    assert_eq!(res2.status(), reqwest::StatusCode::OK);
+    let body2 = res2.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(body2.as_ref(), b"hello world!");
+}
+
+#[tokio::test]
+async fn test_downstream_early_finish_h2_upstream() {
+    init();
+    let id = "early_finish_h2_up";
+
+    // h1 downstream, h2 upstream (x-h2 → h2c origin): exercises the sink branch
+    // and drain in the h2 upstream driver (proxy_h2.rs).
+    let res = reqwest::Client::new()
+        .get("http://127.0.0.1:6147/slow_body/")
+        .header("x-early-finish", id)
+        .header("x-h2", "true")
+        .header("accept-encoding", "identity")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = res.bytes().await.unwrap();
+    assert_eq!(body.as_ref(), EARLY_FINISH_PAGE);
+
+    let (drained, eos) = early_finish_drained(id);
+    assert!(
+        drained < 12,
+        "page should arrive mid-stream, drained={drained}"
+    );
+    assert!(!eos);
+
+    let (drained, eos) = wait_early_finish_drain_complete(id).await;
+    assert_eq!(drained, 12);
+    assert!(eos);
 }

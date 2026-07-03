@@ -84,7 +84,8 @@ impl ProxyHttp for Json2Yaml {
         Ok(())
     }
 
-    fn response_body_filter(
+    // async since the streamscope fork patch made the trait method async
+    async fn response_body_filter(
         &self,
         _session: &mut Session,
         body: &mut Option<Bytes>,
