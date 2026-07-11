@@ -596,6 +596,19 @@ mod tests {
         assert!(reused);
     }
 
+    #[tokio::test]
+    async fn test_connect_tls_ip_sni_verifies_against_ip_san() {
+        let connector = TransportConnector::new(None);
+        let mut peer = BasicPeer::new("1.1.1.1:443");
+        // An address peer: the SNI is an IP literal, so the certificate is verified
+        // against its iPAddress SAN. 1.1.1.1's certificate also carries dNSName SANs,
+        // which is precisely the shape a dNSName-only name check fails on.
+        peer.sni = "1.1.1.1".to_string();
+        assert!(peer.verify_cert() && peer.verify_hostname());
+        let stream = connector.new_stream(&peer).await.unwrap();
+        connector.release_stream(stream, peer.reuse_hash(), None);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     #[cfg(unix)]
     async fn test_connect_uds() {
