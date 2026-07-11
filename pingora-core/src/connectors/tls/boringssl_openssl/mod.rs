@@ -14,6 +14,7 @@
 
 use log::debug;
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
+use std::net::IpAddr;
 use std::sync::{Arc, Once};
 
 use crate::connectors::tls::replace_leftmost_underscore;
@@ -212,17 +213,33 @@ where
     } else if peer.verify_cert() {
         if peer.verify_hostname() {
             let verify_param = ssl_conf.param_mut();
-            add_host(verify_param, peer.sni()).or_err(InternalError, "failed to add host")?;
-            // if sni had underscores in leftmost label replace and add
-            if let Some(sni_s) = replace_leftmost_underscore(peer.sni()) {
-                add_host(verify_param, sni_s.as_ref()).unwrap();
-            }
-            if let Some(alt_cn) = peer.alternative_cn() {
-                if !alt_cn.is_empty() {
-                    add_host(verify_param, alt_cn).unwrap();
-                    // if alt_cn had underscores in leftmost label replace and add
-                    if let Some(alt_cn_s) = replace_leftmost_underscore(alt_cn) {
-                        add_host(verify_param, alt_cn_s.as_ref()).unwrap();
+            // An SNI that is an IP literal names the peer by address, so it must be
+            // checked against the certificate's iPAddress SAN (X509_check_ip). The
+            // host list is matched against dNSName SANs only (falling back to the
+            // subject CN when the certificate carries no dNSName SAN), so adding the
+            // literal there fails against any certificate that has both a dNSName SAN
+            // and an iPAddress SAN. The two checks are ANDed by the verifier, so an
+            // address peer sets the IP alone: a name-shaped `alternative_cn` could
+            // never also match.
+            match peer.sni().parse::<IpAddr>() {
+                Ok(ip) => verify_param
+                    .set_ip(ip)
+                    .or_err(InternalError, "failed to set verify IP")?,
+                Err(_) => {
+                    add_host(verify_param, peer.sni())
+                        .or_err(InternalError, "failed to add host")?;
+                    // if sni had underscores in leftmost label replace and add
+                    if let Some(sni_s) = replace_leftmost_underscore(peer.sni()) {
+                        add_host(verify_param, sni_s.as_ref()).unwrap();
+                    }
+                    if let Some(alt_cn) = peer.alternative_cn() {
+                        if !alt_cn.is_empty() {
+                            add_host(verify_param, alt_cn).unwrap();
+                            // if alt_cn had underscores in leftmost label replace and add
+                            if let Some(alt_cn_s) = replace_leftmost_underscore(alt_cn) {
+                                add_host(verify_param, alt_cn_s.as_ref()).unwrap();
+                            }
+                        }
                     }
                 }
             }
