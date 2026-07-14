@@ -156,20 +156,26 @@ let orig_dst = session.server_addr();
 ## 4. Fully transparent upstream (source spoofing)
 
 To make the **upstream** connection appear to come from the client's IP, bind the
-outbound socket to the client's address with `IP_TRANSPARENT` set *before* bind.
-This is configured on the `Peer` via `BindTo`:
+outbound socket to the client's address with the non-local-bind option set
+*before* bind. This is configured on the `Peer` via `BindTo`:
 
 ```rust
 use pingora_core::connectors::l4::BindTo;
 
 let mut bind_to = BindTo::default();
 bind_to.addr = Some(client_src_addr);   // the client's source address to spoof
-bind_to.set_ip_transparent(true);       // IP_TRANSPARENT before bind()
-// bind_to.set_so_mark(Some(1));         // optional: SO_MARK for policy routing
+bind_to.set_bind_nonlocal(true);        // non-local bind, before bind()
+// bind_to.set_so_mark(Some(1));         // optional: SO_MARK for policy routing (Linux)
 
 // e.g. in upstream_peer():
 peer.options.bind_to = Some(bind_to);
 ```
+
+`bind_nonlocal` is named for the capability it grants — *may this socket bind a
+source address that is not mine?* — because the syscall answering it differs by OS:
+`IP_TRANSPARENT`/`IPV6_TRANSPARENT` on Linux (needs `CAP_NET_ADMIN`) and
+`IP_BINDANY`/`IPV6_BINDANY` on FreeBSD (needs root). The connector selects the right
+one for the address family and the platform.
 
 For the upstream **replies** (destined to the spoofed source) to be delivered
 back to this host, add a return route, e.g.:
@@ -182,7 +188,7 @@ ip route add local 0.0.0.0/0 dev lo table 100   # or a narrower `local <src>` ro
 and mark the upstream socket with `set_so_mark(Some(1))` so its return traffic
 hits that policy route.
 
-> `IP_TRANSPARENT` must be set **before** `bind()`. Pingora does this in the
+> The option must be set **before** `bind()`. Pingora does this in the
 > connector, which is why it is a first-class `BindTo` option rather than
 > something you can set from `upstream_tcp_sock_tweak_hook` (that hook runs
 > *after* bind).
@@ -198,8 +204,8 @@ the address family automatically:
   `IP_TRANSPARENT` on v4 sockets and `IPV6_TRANSPARENT` on v6 sockets.
 - **Original destination:** `get_original_dest()` reads `SO_ORIGINAL_DST` (v4) or
   `IP6T_SO_ORIGINAL_DST` (v6); `server_addr()` works for both under TPROXY.
-- **Upstream spoofing:** `BindTo::set_ip_transparent(true)` with a v6 `addr` sets
-  `IPV6_TRANSPARENT` before binding the v6 source.
+- **Upstream spoofing:** `BindTo::set_bind_nonlocal(true)` with a v6 `addr` sets
+  `IPV6_TRANSPARENT` (Linux) / `IPV6_BINDANY` (FreeBSD) before binding the v6 source.
 
 Use the IPv6 iptables/routing equivalents on the host:
 

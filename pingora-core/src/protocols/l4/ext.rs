@@ -741,9 +741,16 @@ mod test {
         }
         #[cfg(target_os = "freebsd")]
         {
-            // FreeBSD reports back exactly what was set (no Linux-style doubling);
-            // a silent no-op would read 0 here.
-            assert_eq!(get_recv_buf(socket.as_raw_fd()).unwrap(), 102400);
+            // The invariant under test is that the setter is not a silent no-op — one
+            // reads back 0. FreeBSD reports the buffer it actually granted (no
+            // Linux-style doubling), and that is bounded by net.inet.tcp.recvbuf_max,
+            // a tunable; asserting an exact size would make this test a property of
+            // the host's sysctls rather than of the code.
+            assert_ne!(
+                get_recv_buf(socket.as_raw_fd()).unwrap(),
+                0,
+                "SO_RCVBUF must reach the kernel; a no-op setter reads back 0"
+            );
         }
     }
 
