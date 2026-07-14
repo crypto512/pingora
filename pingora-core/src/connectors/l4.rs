@@ -46,12 +46,12 @@ pub struct BindTo {
     port_range: Option<(u16, u16)>,
     // whether we fallback and try again on bind errors when a port range is set
     fallback: bool,
-    /// Set IP_TRANSPARENT on the upstream socket before binding, allowing it to
-    /// bind to and send from a non-local source address (e.g. the client's) for
-    /// fully transparent (source-spoofing) proxying. Pair with `addr` set to the
-    /// client's address. Requires CAP_NET_ADMIN. Linux only.
-    #[cfg(target_os = "linux")]
-    pub ip_transparent: bool,
+    /// Allow the upstream socket to bind to and send from a non-local source
+    /// address (e.g. the client's) for fully transparent (source-spoofing)
+    /// proxying. Pair with `addr` set to the client's address. IP_TRANSPARENT on
+    /// Linux (requires CAP_NET_ADMIN); IP_BINDANY on FreeBSD (requires root).
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    pub bind_nonlocal: bool,
     /// Set SO_MARK on the upstream socket for policy routing, e.g. to steer
     /// spoofed-source upstream traffic through a dedicated routing table.
     /// Requires CAP_NET_ADMIN. Linux only.
@@ -88,14 +88,16 @@ impl BindTo {
         self.fallback = fallback
     }
 
-    /// Enable `IP_TRANSPARENT` on the upstream socket before binding, so it may
-    /// bind a non-local source address (e.g. the client's) for fully transparent
-    /// (source-spoofing) proxying. Pair this with [`BindTo::addr`] set to the
-    /// source address to spoof, and add a return route for it
-    /// (`ip route add local <src> dev lo`). Requires `CAP_NET_ADMIN`. Linux only.
-    #[cfg(target_os = "linux")]
-    pub fn set_ip_transparent(&mut self, transparent: bool) {
-        self.ip_transparent = transparent
+    /// Allow the upstream socket to bind a non-local source address (e.g. the
+    /// client's) for fully transparent (source-spoofing) proxying. Pair this with
+    /// [`BindTo::addr`] set to the source address to spoof, and arrange the
+    /// return-flow delivery: on Linux, `IP_TRANSPARENT` (requires
+    /// `CAP_NET_ADMIN`) plus a local return route (`ip route add local <src> dev
+    /// lo`); on FreeBSD, `IP_BINDANY` (requires root) plus an ipfw `fwd` rule for
+    /// the reply flow.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    pub fn set_bind_nonlocal(&mut self, nonlocal: bool) {
+        self.bind_nonlocal = nonlocal
     }
 
     /// Set `SO_MARK` on the upstream socket for policy routing, e.g. to steer

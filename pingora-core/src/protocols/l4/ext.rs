@@ -16,10 +16,12 @@
 
 #![allow(non_camel_case_types)]
 
+#[cfg(target_os = "linux")]
+use libc::c_ulonglong;
 #[cfg(unix)]
 use libc::socklen_t;
-#[cfg(target_os = "linux")]
-use libc::{c_int, c_ulonglong, c_void};
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+use libc::{c_int, c_void};
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use std::io::{self, ErrorKind};
 use std::mem;
@@ -116,7 +118,7 @@ impl TCP_INFO {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn set_opt<T: Copy>(sock: c_int, opt: c_int, val: c_int, payload: T) -> io::Result<()> {
     unsafe {
         let payload = &payload as *const T as *const c_void;
@@ -131,7 +133,7 @@ fn set_opt<T: Copy>(sock: c_int, opt: c_int, val: c_int, payload: T) -> io::Resu
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn get_opt<T>(
     sock: c_int,
     opt: c_int,
@@ -146,7 +148,7 @@ fn get_opt<T>(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn get_opt_sized<T>(sock: c_int, opt: c_int, val: c_int) -> io::Result<T> {
     let mut payload = mem::MaybeUninit::zeroed();
     let expected_size = mem::size_of::<T>() as socklen_t;
@@ -161,7 +163,7 @@ fn get_opt_sized<T>(sock: c_int, opt: c_int, val: c_int) -> io::Result<T> {
     Ok(payload)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn cvt_linux_error(t: i32) -> io::Result<i32> {
     if t == -1 {
         Err(io::Error::last_os_error())
@@ -210,15 +212,34 @@ fn ip_local_port_range(_fd: RawSocket, _low: u16, _high: u16) -> io::Result<()> 
     Ok(())
 }
 
-/// Set IP_TRANSPARENT (IPv4) or IPV6_TRANSPARENT (IPv6) so the socket may bind
-/// to and send from a non-local source address, e.g. for fully transparent
-/// (source-spoofing) proxying. Must be set before bind(). Requires CAP_NET_ADMIN.
+/// Allow the socket to bind to and send from a non-local source address, e.g.
+/// the intercepted client's, for fully transparent (source-spoofing) proxying.
+/// Must be set before bind().
+///
+/// Linux: IP_TRANSPARENT / IPV6_TRANSPARENT; requires CAP_NET_ADMIN.
 #[cfg(target_os = "linux")]
-fn set_ip_transparent(fd: RawFd, is_ipv6: bool) -> io::Result<()> {
+fn set_bind_nonlocal(fd: RawFd, is_ipv6: bool) -> io::Result<()> {
     if is_ipv6 {
-        set_opt(fd, libc::IPPROTO_IPV6, libc::IPV6_TRANSPARENT, true as c_int)
+        set_opt(
+            fd,
+            libc::IPPROTO_IPV6,
+            libc::IPV6_TRANSPARENT,
+            true as c_int,
+        )
     } else {
         set_opt(fd, libc::IPPROTO_IP, libc::IP_TRANSPARENT, true as c_int)
+    }
+}
+
+/// FreeBSD: IP_BINDANY / IPV6_BINDANY; requires PRIV_NETINET_BINDANY (root).
+/// The reply flow for the spoofed source is delivered back to this socket by
+/// ipfw `fwd`, the FreeBSD analogue of the Linux TPROXY socket-transparent rule.
+#[cfg(target_os = "freebsd")]
+fn set_bind_nonlocal(fd: RawFd, is_ipv6: bool) -> io::Result<()> {
+    if is_ipv6 {
+        set_opt(fd, libc::IPPROTO_IPV6, libc::IPV6_BINDANY, true as c_int)
+    } else {
+        set_opt(fd, libc::IPPROTO_IP, libc::IP_BINDANY, true as c_int)
     }
 }
 
@@ -228,12 +249,12 @@ fn set_so_mark(fd: RawFd, mark: u32) -> io::Result<()> {
     set_opt(fd, libc::SOL_SOCKET, libc::SO_MARK, mark as c_int)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn set_so_keepalive(fd: RawFd, val: bool) -> io::Result<()> {
     set_opt(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, val as c_int)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn set_so_keepalive_idle(fd: RawFd, val: Duration) -> io::Result<()> {
     set_opt(
         fd,
@@ -253,7 +274,7 @@ fn set_so_keepalive_user_timeout(fd: RawFd, val: Duration) -> io::Result<()> {
     )
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn set_so_keepalive_interval(fd: RawFd, val: Duration) -> io::Result<()> {
     set_opt(
         fd,
@@ -263,7 +284,7 @@ fn set_so_keepalive_interval(fd: RawFd, val: Duration) -> io::Result<()> {
     )
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn set_so_keepalive_count(fd: RawFd, val: usize) -> io::Result<()> {
     set_opt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT, val as c_int)
 }
@@ -277,7 +298,16 @@ fn set_keepalive(fd: RawFd, ka: &TcpKeepalive) -> io::Result<()> {
     set_so_keepalive_user_timeout(fd, ka.user_timeout)
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+/// FreeBSD has no TCP_USER_TIMEOUT; the probe-based knobs are the whole contract.
+#[cfg(target_os = "freebsd")]
+fn set_keepalive(fd: RawFd, ka: &TcpKeepalive) -> io::Result<()> {
+    set_so_keepalive(fd, true)?;
+    set_so_keepalive_idle(fd, ka.idle)?;
+    set_so_keepalive_interval(fd, ka.interval)?;
+    set_so_keepalive_count(fd, ka.count)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "freebsd"))))]
 fn set_keepalive(_fd: RawFd, _ka: &TcpKeepalive) -> io::Result<()> {
     Ok(())
 }
@@ -304,13 +334,13 @@ pub fn get_tcp_info(_fd: RawSocket) -> io::Result<TCP_INFO> {
 }
 
 /// Set the TCP receive buffer size. See SO_RCVBUF.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub fn set_recv_buf(fd: RawFd, val: usize) -> Result<()> {
     set_opt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, val as c_int)
         .or_err(ConnectError, "failed to set SO_RCVBUF")
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "freebsd"))))]
 pub fn set_recv_buf(_fd: RawFd, _: usize) -> Result<()> {
     Ok(())
 }
@@ -321,13 +351,13 @@ pub fn set_recv_buf(_sock: RawSocket, _: usize) -> Result<()> {
 }
 
 /// Set the TCP send buffer size. See SO_SNDBUF.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub fn set_snd_buf(fd: RawFd, val: usize) -> Result<()> {
     set_opt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, val as c_int)
         .or_err(ConnectError, "failed to set SO_SNDBUF")
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "freebsd"))))]
 pub fn set_snd_buf(_fd: RawFd, _: usize) -> Result<()> {
     Ok(())
 }
@@ -337,12 +367,12 @@ pub fn set_snd_buf(_sock: RawSocket, _: usize) -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub fn get_recv_buf(fd: RawFd) -> io::Result<usize> {
     get_opt_sized::<c_int>(fd, libc::SOL_SOCKET, libc::SO_RCVBUF).map(|v| v as usize)
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "freebsd"))))]
 pub fn get_recv_buf(_fd: RawFd) -> io::Result<usize> {
     Ok(0)
 }
@@ -352,12 +382,12 @@ pub fn get_recv_buf(_sock: RawSocket) -> io::Result<usize> {
     Ok(0)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub fn get_snd_buf(fd: RawFd) -> io::Result<usize> {
     get_opt_sized::<c_int>(fd, libc::SOL_SOCKET, libc::SO_SNDBUF).map(|v| v as usize)
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "freebsd"))))]
 pub fn get_snd_buf(_fd: RawFd) -> io::Result<usize> {
     Ok(0)
 }
@@ -406,7 +436,7 @@ pub fn set_tcp_fastopen_backlog(_sock: RawSocket, _backlog: usize) -> Result<()>
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub fn set_dscp(fd: RawFd, value: u8) -> Result<()> {
     use super::socket::SocketAddr;
     use pingora_error::OkOrErr;
@@ -426,7 +456,7 @@ pub fn set_dscp(fd: RawFd, value: u8) -> Result<()> {
     }
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "freebsd"))))]
 pub fn set_dscp(_fd: RawFd, _value: u8) -> Result<()> {
     Ok(())
 }
@@ -513,10 +543,12 @@ pub(crate) async fn connect_with<F: FnOnce(&TcpSocket) -> Result<()> + Clone>(
                 let mut new_bind_to = BindTo::default();
                 new_bind_to.addr = bind_to.as_ref().and_then(|b| b.addr);
                 // preserve transparent proxy settings across the retry
+                #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                {
+                    new_bind_to.bind_nonlocal = bind_to.as_ref().is_some_and(|b| b.bind_nonlocal);
+                }
                 #[cfg(target_os = "linux")]
                 {
-                    new_bind_to.ip_transparent =
-                        bind_to.as_ref().is_some_and(|b| b.ip_transparent);
                     new_bind_to.so_mark = bind_to.as_ref().and_then(|b| b.so_mark);
                 }
                 // reset the port range
@@ -551,12 +583,14 @@ async fn inner_connect_with<F: FnOnce(&TcpSocket) -> Result<()>>(
         )?;
 
         if let Some(bind_to) = bind_to {
-            // IP_TRANSPARENT must be set before bind() so the socket can bind to
-            // a non-local (spoofed client) source address for full transparency.
-            #[cfg(target_os = "linux")]
-            if bind_to.ip_transparent {
-                set_ip_transparent(socket.as_raw_fd(), addr.is_ipv6())
-                    .or_err(SocketError, "failed to set socket opts IP_TRANSPARENT")?;
+            // The non-local-bind option must be set before bind() so the socket can
+            // bind a spoofed (client) source address for full transparency.
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            if bind_to.bind_nonlocal {
+                set_bind_nonlocal(socket.as_raw_fd(), addr.is_ipv6()).or_err(
+                    SocketError,
+                    "failed to set socket opts IP_TRANSPARENT/IP_BINDANY",
+                )?;
             }
 
             #[cfg(target_os = "linux")]
@@ -705,6 +739,34 @@ mod test {
             // kernel doubles whatever is set
             assert_eq!(get_recv_buf(socket.as_raw_fd()).unwrap(), 102400 * 2);
         }
+        #[cfg(target_os = "freebsd")]
+        {
+            // FreeBSD reports back exactly what was set (no Linux-style doubling);
+            // a silent no-op would read 0 here.
+            assert_eq!(get_recv_buf(socket.as_raw_fd()).unwrap(), 102400);
+        }
+    }
+
+    /// The non-local-bind option is what lets a fully transparent proxy source
+    /// its upstream socket from the intercepted client's address. TEST-NET-1 is
+    /// guaranteed foreign, so the plain bind failing is the control that proves
+    /// the option — not the host's routing table — is what admits the bind.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[ignore] // requires CAP_NET_ADMIN (Linux) / root (FreeBSD)
+    #[test]
+    fn test_bind_nonlocal_admits_a_foreign_source() {
+        use tokio::net::TcpSocket;
+        let foreign: SocketAddr = "192.0.2.1:0".parse().unwrap();
+
+        let plain = TcpSocket::new_v4().unwrap();
+        assert!(
+            plain.bind(foreign).is_err(),
+            "TEST-NET-1 must not be bindable without the non-local option"
+        );
+
+        let sock = TcpSocket::new_v4().unwrap();
+        set_bind_nonlocal(sock.as_raw_fd(), false).unwrap();
+        sock.bind(foreign).unwrap();
     }
 
     #[cfg(target_os = "linux")]
