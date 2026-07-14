@@ -29,7 +29,7 @@ use http::request::Parts as ReqParts;
 use http::response::Builder as RespBuilder;
 use http::response::Parts as RespParts;
 use http::uri::Uri;
-use pingora_error::{ErrorType::*, OrErr, Result};
+use pingora_error::{ErrorType::*, OkOrErr, OrErr, Result};
 use std::ops::{Deref, DerefMut};
 
 pub use http::method::Method;
@@ -60,6 +60,32 @@ type CaseMap = HMap<CaseHeaderName>;
 pub enum HeaderNameVariant<'a> {
     Case(&'a CaseHeaderName),
     Titled(&'a str),
+}
+
+/// Parse an HTTP/1.1 request-target (RFC 9112 §3.2) into a [Uri].
+///
+/// Two of the four forms reach a server's header parser, and they are tried in the
+/// order they occur in practice:
+///
+/// * **origin-form** (`/where?q=1`) — and asterisk-form (`*`) — what a client sends
+///   to an origin server. It carries no authority, so it builds a path-and-query URI.
+/// * **absolute-form** (`http://host:port/where?q=1`) — what a client MUST send when
+///   the server it is talking to is a **proxy**. The whole URI is kept, authority and
+///   all, so the destination the client named survives to whoever selects the
+///   upstream. [`RequestHeader::raw_path`] still reports only the path-and-query, so
+///   the request this proxy forwards to the origin is written back in origin-form
+///   (RFC 9112 §3.2.1).
+///
+/// authority-form (`CONNECT host:port`) is not accepted here: a `CONNECT` establishes
+/// a tunnel rather than carrying a message this parser would build.
+fn parse_request_target(target: &str) -> Option<Uri> {
+    if let Ok(uri) = Uri::builder().path_and_query(target).build() {
+        return Some(uri);
+    }
+    // Only absolute-form remains. Require BOTH a scheme and an authority so a bare
+    // `host:port` (authority-form) is still rejected rather than read as a scheme.
+    let uri: Uri = target.parse().ok()?;
+    (uri.scheme().is_some() && uri.authority().is_some()).then_some(uri)
 }
 
 /// The HTTP request header type.
@@ -253,15 +279,23 @@ impl RequestHeader {
 
     /// Set the request URI directly via raw bytes.
     ///
+    /// Accepts either request-target form an HTTP/1.1 server can be sent (RFC 9112
+    /// §3.2): **origin-form** (`/path?query`), and **absolute-form**
+    /// (`http://host/path?query`), which a client MUST use when the server it is
+    /// talking to is a *proxy*. An absolute-form target is kept whole, so the
+    /// authority the client named stays readable through `uri.host()` /
+    /// `uri.port_u16()` — while [`Self::raw_path()`] still yields the path-and-query
+    /// alone, so a request this proxy forwards to an origin is serialized back into
+    /// origin-form, per RFC 9112 §3.2.1. Without this a forward proxy cannot serve
+    /// cleartext HTTP at all: the only target its clients ever send fails to parse.
+    ///
     /// Generally prefer [Self::set_uri()] to modify the header's URI if able.
     ///
     /// This API is to allow supporting non UTF-8 cases.
     pub fn set_raw_path(&mut self, path: &[u8]) -> Result<()> {
         if let Ok(p) = std::str::from_utf8(path) {
-            let uri = Uri::builder()
-                .path_and_query(p)
-                .build()
-                .explain_err(InvalidHTTPHeader, |_| format!("invalid uri {}", p))?;
+            let uri = parse_request_target(p)
+                .or_err_with(InvalidHTTPHeader, || format!("invalid uri {}", p))?;
             self.base.uri = uri;
             // keep raw_path empty, no need to store twice
         } else {
@@ -1014,6 +1048,35 @@ mod tests {
         let req = RequestHeader::build("GET", &raw_path[..], None).unwrap();
         assert_eq!("Hello�World", req.uri.path_and_query().unwrap());
         assert_eq!(raw_path, req.raw_path());
+    }
+
+    /// A client talking to a **proxy** sends absolute-form (RFC 9112 §3.2.2), which is
+    /// the only request-target it ever sends for cleartext HTTP. The authority must
+    /// survive parsing — it is the destination, and nothing else carries it — while
+    /// `raw_path` must still report origin-form, so the request the proxy forwards to
+    /// the origin is written back as an origin server expects it (§3.2.1).
+    #[test]
+    fn an_absolute_form_target_keeps_its_authority_and_forwards_as_origin_form() {
+        let req = RequestHeader::build("GET", b"http://example.com/where?q=1", None).unwrap();
+        assert_eq!(Some("example.com"), req.uri.host());
+        assert_eq!(None, req.uri.port_u16());
+        assert_eq!(Some("http"), req.uri.scheme_str());
+        assert_eq!(b"/where?q=1", req.raw_path());
+
+        // An explicit port is part of the destination, so it must survive too.
+        let req = RequestHeader::build("GET", b"http://example.com:8080/", None).unwrap();
+        assert_eq!(Some("example.com"), req.uri.host());
+        assert_eq!(Some(8080), req.uri.port_u16());
+        assert_eq!(b"/", req.raw_path());
+
+        // Origin-form is unchanged: no authority, path reported verbatim.
+        let req = RequestHeader::build("GET", b"/where?q=1", None).unwrap();
+        assert_eq!(None, req.uri.host());
+        assert_eq!(b"/where?q=1", req.raw_path());
+
+        // authority-form (`CONNECT host:port`) carries no message for this parser to
+        // build, and must not be mistaken for an absolute URI whose scheme is a host.
+        assert!(RequestHeader::build("CONNECT", b"example.com:443", None).is_err());
     }
 
     #[cfg(feature = "patched_http1")]
