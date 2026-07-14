@@ -12,22 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use log::{debug, error, warn};
 use nix::errno::Errno;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use nix::sys::socket::{self, AddressFamily, Backlog, RecvMsg, SockFlag, SockType, UnixAddr};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use nix::sys::stat;
 use nix::{Error, NixPath};
 use std::collections::HashMap;
 use std::io::Write;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use std::io::{IoSlice, IoSliceMut};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::io::RawFd;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use std::{thread, time};
 
 // Utilities to transfer file descriptors between sockets, e.g. during graceful upgrades.
@@ -102,7 +102,7 @@ fn deserialize_vec_string(buf: &[u8]) -> Result<Vec<String>, Error> {
     Ok(joined.split_ascii_whitespace().map(String::from).collect())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub fn get_fds_from<P>(
     path: &P,
     payload: &mut [u8],
@@ -192,7 +192,7 @@ where
     Ok((fds, msg.bytes))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
 pub fn get_fds_from<P>(
     _path: &P,
     _payload: &mut [u8],
@@ -201,16 +201,16 @@ pub fn get_fds_from<P>(
 where
     P: ?Sized + NixPath + std::fmt::Display,
 {
-    log::error!("Upgrade is not currently supported outside of Linux platforms");
+    log::error!("Graceful upgrade needs SCM_RIGHTS fd passing, which this platform has no backend for");
     Err(Errno::ECONNREFUSED)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 const MAX_RETRY: usize = 5;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 const RETRY_INTERVAL: time::Duration = time::Duration::from_secs(1);
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn accept_with_retry_timeout(listen_fd: i32, max_retry: usize) -> Result<i32, Error> {
     let mut retried = 0;
     loop {
@@ -238,7 +238,7 @@ fn accept_with_retry_timeout(listen_fd: i32, max_retry: usize) -> Result<i32, Er
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub fn send_fds_to<P>(
     fds: Vec<RawFd>,
     payload: &[u8],
@@ -344,7 +344,11 @@ where
     result
 }
 
-#[cfg(not(target_os = "linux"))]
+/// No fd-passing backend here. Say so, rather than returning an `Ok` that claims to
+/// have sent descriptors it never sent: the caller would then hand its listeners to a
+/// successor that never received them, and a "graceful" upgrade would drop every
+/// connection in flight while reporting success.
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
 pub fn send_fds_to<P>(
     _fds: Vec<RawFd>,
     _payload: &[u8],
@@ -354,11 +358,14 @@ pub fn send_fds_to<P>(
 where
     P: ?Sized + NixPath + std::fmt::Display,
 {
-    Ok(0)
+    log::error!(
+        "Graceful upgrade needs SCM_RIGHTS fd passing, which this platform has no backend for"
+    );
+    Err(Errno::EOPNOTSUPP)
 }
 
 #[cfg(test)]
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 mod tests {
     use std::os::fd::AsRawFd;
 
