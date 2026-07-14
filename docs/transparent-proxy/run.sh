@@ -66,7 +66,7 @@ got=$(grep ORIGDST "$out" | head -1); echo "  proxy said: ${got:-<none>}"
 [ "$got" = "ORIGDST=1.2.3.4:80" ] && ok "TPROXY original dest via getsockname" || no "TPROXY original dest ($got)"
 teardown_topo; rm -f "$out"
 
-echo; echo "### TEST 3: transparent UPSTREAM spoof -> pingora ext::connect + BindTo::set_ip_transparent"
+echo; echo "### TEST 3: transparent UPSTREAM spoof -> pingora ext::connect + BindTo::set_bind_nonlocal"
 setup_topo
 ip netns exec rtr ip route add local 5.5.5.5/32 dev lo   # return path for spoofed source
 bout=$(mktemp); cout=$(mktemp)
@@ -103,7 +103,7 @@ got=$(grep ORIGDST "$out" | head -1); echo "  proxy said: ${got:-<none>}"
 [ "$got" = "ORIGDST=[2001:db8::1]:80" ] && ok "IPv6 TPROXY original dest via getsockname" || no "IPv6 TPROXY original dest ($got)"
 teardown_topo; rm -f "$out"
 
-echo; echo "### TEST 6 (IPv6): transparent UPSTREAM spoof -> ext::connect + BindTo::set_ip_transparent"
+echo; echo "### TEST 6 (IPv6): transparent UPSTREAM spoof -> ext::connect + BindTo::set_bind_nonlocal"
 setup_topo
 ip netns exec rtr ip -6 route add local fd00::9/128 dev lo   # return path for spoofed v6 source
 bout=$(mktemp); cout=$(mktemp)
