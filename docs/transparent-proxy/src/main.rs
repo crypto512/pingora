@@ -3,27 +3,42 @@
 // Exercises the three code paths a transparent proxy relies on:
 //   * NAT REDIRECT interception  -> pingora_core ext::get_original_dest (SO_ORIGINAL_DST)
 //   * TPROXY interception         -> IP_TRANSPARENT listener + getsockname (local addr)
-//   * fully transparent upstream  -> pingora_core ext::connect + BindTo::set_bind_nonlocal
+//   * fully transparent upstream  -> PeerOptions::upstream_tcp_sock_tweak_hook binding the
+//                                    client's source after IP_TRANSPARENT
 //
 // Each subcommand serves exactly one connection, prints a RESULT line, and exits,
 // so `run.sh` can orchestrate ordering across network namespaces. Needs
 // CAP_NET_ADMIN (run inside the privileged container from run.sh).
 
-use pingora_core::connectors::l4::BindTo;
-use pingora_core::protocols::l4::ext::{connect as pingora_connect, get_original_dest};
+use pingora_core::connectors::TransportConnector;
+use pingora_core::protocols::l4::ext::get_original_dest;
+use pingora_core::upstreams::peer::HttpPeer;
+use pingora_core::{ErrorType, OrErr};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::os::unix::io::AsRawFd;
+use std::sync::Arc;
 
 // Raw IPV6_TRANSPARENT setsockopt (socket2 only exposes the v4 variant).
 fn set_ipv6_transparent(fd: std::os::unix::io::RawFd) -> std::io::Result<()> {
+    set_transparent(fd, libc::IPPROTO_IPV6, libc::IPV6_TRANSPARENT)
+}
+
+// IP_TRANSPARENT (v4) or IPV6_TRANSPARENT (v6) through libc, the way pingora-core's own
+// listener sets it: socket2's v4 setter is named differently across the socket2 versions
+// pingora-core accepts, and has no v6 twin.
+fn set_transparent(
+    fd: std::os::unix::io::RawFd,
+    level: libc::c_int,
+    name: libc::c_int,
+) -> std::io::Result<()> {
     let on: libc::c_int = 1;
     let ret = unsafe {
         libc::setsockopt(
             fd,
-            libc::IPPROTO_IPV6,
-            libc::IPV6_TRANSPARENT,
+            level,
+            name,
             &on as *const _ as *const libc::c_void,
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
         )
@@ -136,22 +151,37 @@ fn proxy_tproxy_dual(bind: &str) {
     sock.listen(128).expect("listen");
     println!("READY");
     let (conn, _peer) = sock.accept().expect("tproxy accept");
-    let local = conn.local_addr().expect("getsockname").as_socket().expect("inet");
+    let local = conn
+        .local_addr()
+        .expect("getsockname")
+        .as_socket()
+        .expect("inet");
     println!("ORIGDST={local}");
 }
 
-// Fully transparent upstream: use pingora's own connect() with a transparent
-// BindTo so the outbound socket binds a *non-local* source address (spoofing the
-// client). Requires `ip route add local <src-ip> dev lo` for the return path.
+// Fully transparent upstream: pingora's own connector, with the peer's socket hook
+// binding a *non-local* source address (spoofing the client). With no `BindTo` the
+// connector binds nothing, so the hook receives the socket unbound and sets
+// IP_TRANSPARENT / IPV6_TRANSPARENT before its own bind — the order the option needs.
+// Requires `ip route add local <src-ip> dev lo` for the return path.
 fn upstream_spoof(dst: &str, src: &str) {
     let dst: SocketAddr = dst.parse().expect("bad dst");
     let src: SocketAddr = src.parse().expect("bad src");
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async move {
-        let mut bind_to = BindTo::default();
-        bind_to.addr = Some(src);
-        bind_to.set_bind_nonlocal(true);
-        match pingora_connect(&dst, Some(&bind_to)).await {
+        let mut peer = HttpPeer::new(dst, false, String::new());
+        peer.options.upstream_tcp_sock_tweak_hook = Some(Arc::new(move |sock| {
+            let (level, name) = if src.is_ipv6() {
+                (libc::IPPROTO_IPV6, libc::IPV6_TRANSPARENT)
+            } else {
+                (libc::IPPROTO_IP, libc::IP_TRANSPARENT)
+            };
+            set_transparent(sock.as_raw_fd(), level, name)
+                .or_err(ErrorType::SocketError, "set IP_TRANSPARENT")?;
+            sock.bind(src)
+                .or_err(ErrorType::BindError, "bind the spoofed source")
+        }));
+        match TransportConnector::new(None).new_stream(&peer).await {
             Ok(mut stream) => {
                 use tokio::io::AsyncWriteExt;
                 let _ = stream.write_all(b"hi\n").await;
