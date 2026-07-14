@@ -19,7 +19,10 @@ use std::time::{Duration, SystemTime};
 
 use once_cell::sync::OnceCell;
 
-use super::l4::ext::{get_original_dest, get_recv_buf, get_snd_buf, get_tcp_info, TCP_INFO};
+use super::l4::ext::{
+    get_original_dest, get_recv_buf, get_snd_buf, get_tcp_info, set_recv_buf, set_snd_buf,
+    TCP_INFO,
+};
 use super::l4::socket::SocketAddr;
 use super::raw_connect::ProxyDigest;
 use super::tls::digest::SslDigest;
@@ -188,6 +191,26 @@ impl SocketDigest {
         } else {
             None
         }
+    }
+
+    /// Set both socket buffer sizes on the underlying socket (SO_SNDBUF and
+    /// SO_RCVBUF). No-op on a non-inet socket.
+    #[cfg(unix)]
+    pub fn set_buf_sizes(&self, val: usize) -> pingora_error::Result<()> {
+        if self.is_inet() {
+            set_snd_buf(self.raw_fd, val)?;
+            set_recv_buf(self.raw_fd, val)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    pub fn set_buf_sizes(&self, val: usize) -> pingora_error::Result<()> {
+        if self.is_inet() {
+            set_snd_buf(self.raw_sock, val)?;
+            set_recv_buf(self.raw_sock, val)?;
+        }
+        Ok(())
     }
 
     #[cfg(unix)]

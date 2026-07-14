@@ -754,6 +754,31 @@ mod test {
         }
     }
 
+    #[test]
+    fn test_set_snd_buf() {
+        use tokio::net::TcpSocket;
+        let socket = TcpSocket::new_v4().unwrap();
+        #[cfg(unix)]
+        set_snd_buf(socket.as_raw_fd(), 102400).unwrap();
+        #[cfg(windows)]
+        set_snd_buf(socket.as_raw_socket(), 102400).unwrap();
+
+        #[cfg(target_os = "linux")]
+        {
+            // kernel doubles whatever is set
+            assert_eq!(get_snd_buf(socket.as_raw_fd()).unwrap(), 102400 * 2);
+        }
+        #[cfg(target_os = "freebsd")]
+        {
+            // Same invariant as the recv test: the setter must not be a silent no-op.
+            assert_ne!(
+                get_snd_buf(socket.as_raw_fd()).unwrap(),
+                0,
+                "SO_SNDBUF must reach the kernel; a no-op setter reads back 0"
+            );
+        }
+    }
+
     /// The non-local-bind option is what lets a fully transparent proxy source
     /// its upstream socket from the intercepted client's address. TEST-NET-1 is
     /// guaranteed foreign, so the plain bind failing is the control that proves

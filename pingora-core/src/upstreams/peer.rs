@@ -243,6 +243,11 @@ pub trait Peer: Display + Clone {
         self.get_peer_options().and_then(|o| o.tcp_recv_buf)
     }
 
+    /// The size of the TCP send buffer should be limited to. See SO_SNDBUF for more details.
+    fn tcp_snd_buf(&self) -> Option<usize> {
+        self.get_peer_options().and_then(|o| o.tcp_snd_buf)
+    }
+
     /// The DSCP value that should be applied to the send side of this connection.
     /// See the [RFC](https://datatracker.ietf.org/doc/html/rfc2474) for more details.
     fn dscp(&self) -> Option<u8> {
@@ -504,6 +509,7 @@ pub struct PeerOptions {
     pub ca: Option<Arc<CaType>>,
     pub tcp_keepalive: Option<TcpKeepalive>,
     pub tcp_recv_buf: Option<usize>,
+    pub tcp_snd_buf: Option<usize>,
     pub dscp: Option<u8>,
     pub h2_ping_interval: Option<Duration>,
     #[cfg(feature = "s2n")]
@@ -574,6 +580,7 @@ impl PeerOptions {
             ca: None,
             tcp_keepalive: None,
             tcp_recv_buf: None,
+            tcp_snd_buf: None,
             dscp: None,
             h2_ping_interval: None,
             #[cfg(feature = "s2n")]

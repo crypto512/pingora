@@ -15,7 +15,8 @@
 #[cfg(unix)]
 use crate::protocols::l4::ext::connect_uds;
 use crate::protocols::l4::ext::{
-    connect_with as tcp_connect, set_dscp, set_recv_buf, set_tcp_fastopen_connect,
+    connect_with as tcp_connect, set_dscp, set_recv_buf, set_snd_buf,
+    set_tcp_fastopen_connect,
 };
 use crate::protocols::l4::socket::SocketAddr;
 use crate::protocols::l4::stream::Stream;
@@ -148,6 +149,10 @@ where
                         if let Some(recv_buf) = peer.tcp_recv_buf() {
                             debug!("Setting recv buf size");
                             set_recv_buf(raw, recv_buf)?;
+                        }
+                        if let Some(snd_buf) = peer.tcp_snd_buf() {
+                            debug!("Setting snd buf size");
+                            set_snd_buf(raw, snd_buf)?;
                         }
                         if let Some(dscp) = peer.dscp() {
                             debug!("Setting dscp");
