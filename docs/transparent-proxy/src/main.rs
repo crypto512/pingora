@@ -3,7 +3,7 @@
 // Exercises the three code paths a transparent proxy relies on:
 //   * NAT REDIRECT interception  -> pingora_core ext::get_original_dest (SO_ORIGINAL_DST)
 //   * TPROXY interception         -> IP_TRANSPARENT listener + getsockname (local addr)
-//   * fully transparent upstream  -> pingora_core ext::connect + BindTo::set_ip_transparent
+//   * fully transparent upstream  -> pingora_core ext::connect + BindTo::set_bind_nonlocal
 //
 // Each subcommand serves exactly one connection, prints a RESULT line, and exits,
 // so `run.sh` can orchestrate ordering across network namespaces. Needs
@@ -150,7 +150,7 @@ fn upstream_spoof(dst: &str, src: &str) {
     rt.block_on(async move {
         let mut bind_to = BindTo::default();
         bind_to.addr = Some(src);
-        bind_to.set_ip_transparent(true);
+        bind_to.set_bind_nonlocal(true);
         match pingora_connect(&dst, Some(&bind_to)).await {
             Ok(mut stream) => {
                 use tokio::io::AsyncWriteExt;

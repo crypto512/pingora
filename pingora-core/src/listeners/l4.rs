@@ -206,6 +206,10 @@ fn apply_tcp_socket_options(
 
     let socket_ref = socket2::SockRef::from(sock);
 
+    // Only the Linux IP_TRANSPARENT branch below reads the address family.
+    #[cfg(not(target_os = "linux"))]
+    let _ = addr;
+
     if let Some(ipv6_only) = opt.ipv6_only {
         socket_ref
             .set_only_v6(ipv6_only)
