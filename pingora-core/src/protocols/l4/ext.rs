@@ -16,10 +16,12 @@
 
 #![allow(non_camel_case_types)]
 
+#[cfg(target_os = "linux")]
+use libc::c_ulonglong;
 #[cfg(unix)]
 use libc::socklen_t;
-#[cfg(target_os = "linux")]
-use libc::{c_int, c_ulonglong, c_void};
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+use libc::{c_int, c_void};
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use socket2::Socket;
 use std::io::{self, ErrorKind};
@@ -117,7 +119,7 @@ impl TCP_INFO {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn set_opt<T: Copy>(sock: c_int, opt: c_int, val: c_int, payload: T) -> io::Result<()> {
     unsafe {
         let payload = &payload as *const T as *const c_void;
@@ -132,7 +134,7 @@ fn set_opt<T: Copy>(sock: c_int, opt: c_int, val: c_int, payload: T) -> io::Resu
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn get_opt<T>(
     sock: c_int,
     opt: c_int,
@@ -147,7 +149,7 @@ fn get_opt<T>(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn get_opt_sized<T>(sock: c_int, opt: c_int, val: c_int) -> io::Result<T> {
     let mut payload = mem::MaybeUninit::zeroed();
     let expected_size = mem::size_of::<T>() as socklen_t;
@@ -162,7 +164,7 @@ fn get_opt_sized<T>(sock: c_int, opt: c_int, val: c_int) -> io::Result<T> {
     Ok(payload)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn cvt_linux_error(t: i32) -> io::Result<i32> {
     if t == -1 {
         Err(io::Error::last_os_error())
@@ -211,12 +213,12 @@ fn ip_local_port_range(_fd: RawSocket, _low: u16, _high: u16) -> io::Result<()> 
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn set_so_keepalive(fd: RawFd, val: bool) -> io::Result<()> {
     set_opt(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, val as c_int)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn set_so_keepalive_idle(fd: RawFd, val: Duration) -> io::Result<()> {
     set_opt(
         fd,
@@ -236,7 +238,7 @@ fn set_so_keepalive_user_timeout(fd: RawFd, val: Duration) -> io::Result<()> {
     )
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn set_so_keepalive_interval(fd: RawFd, val: Duration) -> io::Result<()> {
     set_opt(
         fd,
@@ -246,7 +248,7 @@ fn set_so_keepalive_interval(fd: RawFd, val: Duration) -> io::Result<()> {
     )
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn set_so_keepalive_count(fd: RawFd, val: usize) -> io::Result<()> {
     set_opt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT, val as c_int)
 }
@@ -260,7 +262,16 @@ fn set_keepalive(fd: RawFd, ka: &TcpKeepalive) -> io::Result<()> {
     set_so_keepalive_user_timeout(fd, ka.user_timeout)
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+/// FreeBSD has no TCP_USER_TIMEOUT; the probe-based knobs are the whole contract.
+#[cfg(target_os = "freebsd")]
+fn set_keepalive(fd: RawFd, ka: &TcpKeepalive) -> io::Result<()> {
+    set_so_keepalive(fd, true)?;
+    set_so_keepalive_idle(fd, ka.idle)?;
+    set_so_keepalive_interval(fd, ka.interval)?;
+    set_so_keepalive_count(fd, ka.count)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "freebsd"))))]
 fn set_keepalive(_fd: RawFd, _ka: &TcpKeepalive) -> io::Result<()> {
     Ok(())
 }
@@ -287,13 +298,13 @@ pub fn get_tcp_info(_fd: RawSocket) -> io::Result<TCP_INFO> {
 }
 
 /// Set the TCP receive buffer size. See SO_RCVBUF.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub fn set_recv_buf(fd: RawFd, val: usize) -> Result<()> {
     set_opt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, val as c_int)
         .or_err(ConnectError, "failed to set SO_RCVBUF")
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "freebsd"))))]
 pub fn set_recv_buf(_fd: RawFd, _: usize) -> Result<()> {
     Ok(())
 }
@@ -304,13 +315,13 @@ pub fn set_recv_buf(_sock: RawSocket, _: usize) -> Result<()> {
 }
 
 /// Set the TCP send buffer size. See SO_SNDBUF.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub fn set_snd_buf(fd: RawFd, val: usize) -> Result<()> {
     set_opt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, val as c_int)
         .or_err(ConnectError, "failed to set SO_SNDBUF")
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "freebsd"))))]
 pub fn set_snd_buf(_fd: RawFd, _: usize) -> Result<()> {
     Ok(())
 }
@@ -320,12 +331,12 @@ pub fn set_snd_buf(_sock: RawSocket, _: usize) -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub fn get_recv_buf(fd: RawFd) -> io::Result<usize> {
     get_opt_sized::<c_int>(fd, libc::SOL_SOCKET, libc::SO_RCVBUF).map(|v| v as usize)
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "freebsd"))))]
 pub fn get_recv_buf(_fd: RawFd) -> io::Result<usize> {
     Ok(0)
 }
@@ -335,12 +346,12 @@ pub fn get_recv_buf(_sock: RawSocket) -> io::Result<usize> {
     Ok(0)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub fn get_snd_buf(fd: RawFd) -> io::Result<usize> {
     get_opt_sized::<c_int>(fd, libc::SOL_SOCKET, libc::SO_SNDBUF).map(|v| v as usize)
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "freebsd"))))]
 pub fn get_snd_buf(_fd: RawFd) -> io::Result<usize> {
     Ok(0)
 }
@@ -389,7 +400,7 @@ pub fn set_tcp_fastopen_backlog(_sock: RawSocket, _backlog: usize) -> Result<()>
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub fn set_dscp(fd: RawFd, value: u8) -> Result<()> {
     use super::socket::SocketAddr;
     use pingora_error::OkOrErr;
@@ -409,7 +420,7 @@ pub fn set_dscp(fd: RawFd, value: u8) -> Result<()> {
     }
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "freebsd"))))]
 pub fn set_dscp(_fd: RawFd, _value: u8) -> Result<()> {
     Ok(())
 }
@@ -818,6 +829,37 @@ mod test {
         {
             // kernel doubles whatever is set
             assert_eq!(get_recv_buf(socket.as_raw_fd()).unwrap(), 102400 * 2);
+        }
+        #[cfg(target_os = "freebsd")]
+        {
+            // FreeBSD reports back exactly what was set (no Linux-style doubling);
+            // a silent no-op would read 0 here.
+            assert_eq!(get_recv_buf(socket.as_raw_fd()).unwrap(), 102400);
+        }
+    }
+
+    #[test]
+    fn test_set_snd_buf() {
+        use tokio::net::TcpSocket;
+        let socket = TcpSocket::new_v4().unwrap();
+        #[cfg(unix)]
+        set_snd_buf(socket.as_raw_fd(), 102400).unwrap();
+        #[cfg(windows)]
+        set_snd_buf(socket.as_raw_socket(), 102400).unwrap();
+
+        #[cfg(target_os = "linux")]
+        {
+            // kernel doubles whatever is set
+            assert_eq!(get_snd_buf(socket.as_raw_fd()).unwrap(), 102400 * 2);
+        }
+        #[cfg(target_os = "freebsd")]
+        {
+            // Same invariant as the recv test: the setter must not be a silent no-op.
+            assert_ne!(
+                get_snd_buf(socket.as_raw_fd()).unwrap(),
+                0,
+                "SO_SNDBUF must reach the kernel; a no-op setter reads back 0"
+            );
         }
     }
 
