@@ -20,8 +20,7 @@ use std::time::{Duration, SystemTime};
 use once_cell::sync::OnceCell;
 
 use super::l4::ext::{
-    get_original_dest, get_recv_buf, get_snd_buf, get_tcp_info, set_recv_buf, set_snd_buf,
-    TCP_INFO,
+    get_original_dest, get_recv_buf, get_snd_buf, get_tcp_info, set_recv_buf, set_snd_buf, TCP_INFO,
 };
 use super::l4::socket::SocketAddr;
 use super::raw_connect::ProxyDigest;
@@ -91,6 +90,11 @@ pub struct SocketDigest {
     pub local_addr: OnceCell<Option<SocketAddr>>,
     /// Original destination address
     pub original_dst: OnceCell<Option<SocketAddr>>,
+    /// The TLS SNI (transparent) or CONNECT authority (explicit) the connection was
+    /// intercepted for, stamped by the interception front-end so the decrypted inner
+    /// pipeline can compare it against the request's `Host` header. Unset on any path
+    /// that was not TLS-intercepted for a named host.
+    pub peeked_sni: OnceCell<String>,
 }
 
 impl SocketDigest {
@@ -101,6 +105,7 @@ impl SocketDigest {
             peer_addr: OnceCell::new(),
             local_addr: OnceCell::new(),
             original_dst: OnceCell::new(),
+            peeked_sni: OnceCell::new(),
         }
     }
 
@@ -111,6 +116,7 @@ impl SocketDigest {
             peer_addr: OnceCell::new(),
             local_addr: OnceCell::new(),
             original_dst: OnceCell::new(),
+            peeked_sni: OnceCell::new(),
         }
     }
 
