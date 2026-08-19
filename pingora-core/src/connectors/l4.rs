@@ -475,8 +475,11 @@ mod tests {
         assert!(
             error.etype() == &ConnectError
                 || error.etype() == &ConnectTimedout
-                // The error seen on mac: https://github.com/cloudflare/pingora/pull/679
-                || (error.etype() == &InternalError),
+                // Platforms that defer source-address validation to connect() (macOS, FreeBSD)
+                // report an unusable source as EADDRNOTAVAIL there. With no port range in play
+                // that is a route failure, so it classifies as ConnectNoRoute — matching what
+                // test_connector_bind_to accepts for this same unroutable destination.
+                || error.etype() == &ConnectNoRoute,
             "{error:?}"
         )
     }
