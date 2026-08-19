@@ -191,26 +191,32 @@ fn ip_bind_addr_no_port(_fd: RawFd, _val: bool) -> io::Result<()> {
 /// IP_LOCAL_PORT_RANGE is only supported on Linux 6.3 and higher,
 /// ip_local_port_range() is a no-op on unsupported versions.
 /// See the [man page](https://man7.org/linux/man-pages/man7/ip.7.html) for more details.
+/// Returns whether the kernel actually applied a *restricting* range. `(0, 0)` clears the
+/// range rather than narrowing it, and an old kernel answers `ENOPROTOOPT`; both leave the
+/// socket free to use the whole ephemeral range, so both report `false`. Callers classify on
+/// what was applied, never on what was asked for.
 #[cfg(target_os = "linux")]
-fn ip_local_port_range(fd: RawFd, low: u16, high: u16) -> io::Result<()> {
+fn ip_local_port_range(fd: RawFd, low: u16, high: u16) -> io::Result<bool> {
     const IP_LOCAL_PORT_RANGE: i32 = 51;
     let range: u32 = (low as u32) | ((high as u32) << 16);
 
     let result = set_opt(fd, libc::IPPROTO_IP, IP_LOCAL_PORT_RANGE, range as c_int);
     match result {
         Err(e) if e.raw_os_error() != Some(libc::ENOPROTOOPT) => Err(e),
-        _ => Ok(()), // no error or ENOPROTOOPT
+        // The kernel predates IP_LOCAL_PORT_RANGE: nothing was applied.
+        Err(_) => Ok(false),
+        Ok(()) => Ok(low != 0 || high != 0),
     }
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-fn ip_local_port_range(_fd: RawFd, _low: u16, _high: u16) -> io::Result<()> {
-    Ok(())
+fn ip_local_port_range(_fd: RawFd, _low: u16, _high: u16) -> io::Result<bool> {
+    Ok(false)
 }
 
 #[cfg(windows)]
-fn ip_local_port_range(_fd: RawSocket, _low: u16, _high: u16) -> io::Result<()> {
-    Ok(())
+fn ip_local_port_range(_fd: RawSocket, _low: u16, _high: u16) -> io::Result<bool> {
+    Ok(false)
 }
 
 /// Allow the socket to bind to and send from a non-local source address, e.g.
@@ -699,9 +705,10 @@ async fn inner_connect_with<F: FnOnce(&TcpSocket) -> Result<()>>(
     attempt: &mut ConnectAttempt,
 ) -> Result<TcpStream> {
     attempt.clear();
-    // Whether this connect constrains the source port to a range. Read once here so the
-    // connect-error classification below cannot drift from what was actually requested.
-    let constrained_local_port = bind_to.is_some_and(|b| b.port_range().is_some());
+    // What this connect actually pinned about its local endpoint. Recorded as the socket is
+    // set up, never inferred afterwards from the BindTo — whose port range may be a reset
+    // sentinel, or unsupported by the running kernel.
+    let mut local_binding = LocalBinding::Unbound;
     let socket = if addr.is_ipv4() {
         TcpSocket::new_v4()
     } else {
@@ -734,8 +741,11 @@ async fn inner_connect_with<F: FnOnce(&TcpSocket) -> Result<()>>(
             }
 
             if let Some((low, high)) = bind_to.port_range() {
-                ip_local_port_range(socket.as_raw_fd(), low, high)
+                let applied = ip_local_port_range(socket.as_raw_fd(), low, high)
                     .or_err(SocketError, "failed to set socket opts IP_LOCAL_PORT_RANGE")?;
+                if applied {
+                    local_binding = LocalBinding::PortRange;
+                }
             }
 
             if let Some(baddr) = bind_to.addr {
@@ -753,6 +763,9 @@ async fn inner_connect_with<F: FnOnce(&TcpSocket) -> Result<()>>(
                 socket
                     .bind(baddr)
                     .or_err_with(BindError, || format!("failed to bind to socket {}", baddr))?;
+                if matches!(local_binding, LocalBinding::Unbound) {
+                    local_binding = LocalBinding::Source;
+                }
             }
         }
     }
@@ -781,7 +794,7 @@ async fn inner_connect_with<F: FnOnce(&TcpSocket) -> Result<()>>(
                 error,
                 format!("Fail to connect to {}", *addr),
                 attempt.local_addr(),
-                constrained_local_port,
+                local_binding,
             ));
         }
     } else {
@@ -803,7 +816,7 @@ async fn inner_connect_with<F: FnOnce(&TcpSocket) -> Result<()>>(
             error,
             format!("Fail to connect to {}", *addr),
             attempt.local_addr(),
-            constrained_local_port,
+            local_binding,
         ));
     }
 
@@ -826,43 +839,60 @@ pub async fn connect_uds(path: &std::path::Path) -> Result<UnixStream> {
             e,
             format!("Fail to connect to {}", path.display()),
             None,
-            false,
+            LocalBinding::Unbound,
         )
     })
+}
+
+/// What a `connect()` pinned about its own local endpoint. `EADDRNOTAVAIL` from `connect()`
+/// carries a different meaning in each case, and the errno alone cannot tell them apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocalBinding {
+    /// Neither a source address nor an applied port range: the kernel chose the whole local
+    /// endpoint. `EADDRNOTAVAIL` then reports that it ran out of ephemeral ports.
+    Unbound,
+    /// A source address was bound, with the port left to the kernel. `EADDRNOTAVAIL` reports
+    /// that the destination is not reachable from that source.
+    Source,
+    /// The kernel accepted a restricting `IP_LOCAL_PORT_RANGE`. `EADDRNOTAVAIL` reports that
+    /// the range is exhausted.
+    PortRange,
 }
 
 /// Classify an error returned by `connect()` (never by `bind()` — those are wrapped as
 /// [`BindError`] at the bind call site).
 ///
-/// `constrained_local_port` says whether this connect asked the kernel to pick the source
-/// port out of a restricted range (`IP_LOCAL_PORT_RANGE`). It decides what a connect-time
-/// `EADDRNOTAVAIL` means, and the two meanings are not interchangeable:
+/// Only [`LocalBinding`] separates the meanings of a connect-time `EADDRNOTAVAIL`:
 ///
-/// - **With** a range, the errno reports an exhausted range. Port selection is deferred to
-///   `connect()` under `IP_BIND_ADDRESS_NO_PORT`, so this is the only place that failure can
-///   surface. It must stay a [`BindError`]: that is the signal
-///   [`connect_with_attempt`] retries on, widening the range.
-/// - **Without** one, nothing about the local port was constrained, so the errno reports that
-///   the destination is not reachable from the bound source — a routing failure
-///   ([`ConnectNoRoute`]), not a local-binding one.
+/// - [`LocalBinding::PortRange`] — an exhausted range. Port selection is deferred to
+///   `connect()` under `IP_BIND_ADDRESS_NO_PORT`, so this is the only place it can surface.
+///   It must stay a [`BindError`]: that is the signal [`connect_with_attempt`] retries on to
+///   widen the range.
+/// - [`LocalBinding::Source`] — the destination is not reachable from the bound source, a
+///   routing failure ([`ConnectNoRoute`]) rather than a local-binding one.
+/// - [`LocalBinding::Unbound`] — nothing local was pinned, so the kernel exhausted the
+///   ephemeral range. That is a local resource limit, not a route: it stays a [`BindError`],
+///   which the L4 connector reports as an `InternalError`.
 ///
-/// Conflating them is invisible on Linux, where the kernel rejects an unusable source at
-/// `bind()` and connect-time `EADDRNOTAVAIL` is therefore almost always the port-range case.
-/// FreeBSD defers source validation to `connect()` and reports both through this one errno, so
-/// the conflation surfaces there as an unroutable origin reported as `BindError` — which the L4
-/// connector escalates to `InternalError`, turning "no route" into "internal fault" in the
-/// caller's error handling, its metrics and its audit record.
+/// Collapsing these is invisible on Linux, where the kernel rejects an unusable source at
+/// `bind()`, so connect-time `EADDRNOTAVAIL` is dominated by the two local-resource cases.
+/// FreeBSD and macOS defer source validation to `connect()` and report every meaning through
+/// the one errno, so there an unroutable origin reads as `BindError` — escalated by the
+/// connector to `InternalError`, turning "no route" into "internal fault" for the caller's
+/// error handling and its metrics.
 fn wrap_os_connect_error(
     e: std::io::Error,
     context: String,
     local_addr: Option<SocketAddr>,
-    constrained_local_port: bool,
+    local_binding: LocalBinding,
 ) -> Box<Error> {
     let etype = match e.kind() {
         ErrorKind::ConnectionRefused => ConnectRefused,
         ErrorKind::TimedOut => ConnectTimedout,
-        ErrorKind::AddrNotAvailable if constrained_local_port => BindError,
-        ErrorKind::AddrNotAvailable => ConnectNoRoute,
+        ErrorKind::AddrNotAvailable => match local_binding {
+            LocalBinding::Source => ConnectNoRoute,
+            LocalBinding::PortRange | LocalBinding::Unbound => BindError,
+        },
         ErrorKind::PermissionDenied | ErrorKind::AddrInUse => InternalError,
         _ => match e.raw_os_error() {
             Some(libc::ENETUNREACH | libc::EHOSTUNREACH) => ConnectNoRoute,
@@ -1042,35 +1072,52 @@ mod test {
         // connect() return right away as the SYN goes out only when the first write() is called.
         assert!(connection_time.as_millis() < 4);
     }
-    /// A connect-time `EADDRNOTAVAIL` means two different things, and the classification must
-    /// follow what the caller actually asked for rather than the errno alone.
-    ///
-    /// Unconstrained (the case every ordinary upstream connect takes): the destination is not
-    /// reachable from the bound source, so it is a route failure. Reporting it as a
-    /// [`BindError`] makes the L4 connector escalate it to `InternalError`, and an unroutable
-    /// origin then reads as an internal fault to every caller, metric and audit record.
-    #[test]
-    fn an_unconstrained_connect_reports_eaddrnotavail_as_no_route() {
-        let e = wrap_os_connect_error(
+    fn eaddrnotavail(binding: LocalBinding) -> Box<Error> {
+        wrap_os_connect_error(
             io::Error::from_raw_os_error(libc::EADDRNOTAVAIL),
             "test".into(),
             None,
-            false,
-        );
-        assert_eq!(e.etype(), &ConnectNoRoute);
+            binding,
+        )
     }
 
-    /// With `IP_LOCAL_PORT_RANGE` the same errno reports an exhausted range instead. It must
-    /// stay a [`BindError`], because that is the signal `connect_with_attempt` retries on to
-    /// widen the range — classify it as a route failure and the fallback silently stops firing.
+    /// A bound source with an unreachable destination is a route failure. Reporting it as a
+    /// [`BindError`] makes the L4 connector escalate it to `InternalError`, so an unroutable
+    /// origin reads as an internal fault to every caller and metric.
     #[test]
-    fn a_port_constrained_connect_keeps_eaddrnotavail_retryable() {
-        let e = wrap_os_connect_error(
-            io::Error::from_raw_os_error(libc::EADDRNOTAVAIL),
-            "test".into(),
-            None,
-            true,
-        );
-        assert_eq!(e.etype(), &BindError);
+    fn a_bound_source_reports_eaddrnotavail_as_no_route() {
+        assert_eq!(eaddrnotavail(LocalBinding::Source).etype(), &ConnectNoRoute);
+    }
+
+    /// An applied `IP_LOCAL_PORT_RANGE` turns the same errno into range exhaustion. It must
+    /// stay a [`BindError`], because that is the signal `connect_with_attempt` retries on to
+    /// widen the range — classify it as a route failure and the fallback stops firing.
+    #[test]
+    fn an_applied_port_range_keeps_eaddrnotavail_retryable() {
+        assert_eq!(eaddrnotavail(LocalBinding::PortRange).etype(), &BindError);
+    }
+
+    /// With nothing pinned locally the kernel ran out of ephemeral ports. That is a local
+    /// resource limit, and calling it "no route" sends an operator hunting a routing fault
+    /// while the box is actually out of ports.
+    #[test]
+    fn an_unbound_connect_reports_eaddrnotavail_as_a_local_limit() {
+        assert_eq!(eaddrnotavail(LocalBinding::Unbound).etype(), &BindError);
+    }
+
+    /// `set_port_range(None)` stores the `(0, 0)` reset sentinel rather than clearing the
+    /// field, and an old kernel answers `ENOPROTOOPT`. Neither narrows anything, so neither
+    /// may be recorded as a constraint — otherwise the reset state silently returns to
+    /// reporting an unroutable origin as a bind failure.
+    #[test]
+    fn a_reset_port_range_is_not_a_constraint() {
+        let sock = std::net::TcpStream::connect(
+            std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!ip_local_port_range(sock.as_raw_fd(), 0, 0).unwrap());
     }
 }
