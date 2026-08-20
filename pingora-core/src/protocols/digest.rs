@@ -95,6 +95,13 @@ pub struct SocketDigest {
     /// pipeline can compare it against the request's `Host` header. Unset on any path
     /// that was not TLS-intercepted for a named host.
     pub peeked_sni: OnceCell<String>,
+    /// The full guarded, ordered upstream address set an interception front-end
+    /// resolved for the intercepted destination, stamped so the decrypted inner
+    /// pipeline can fail over across the addresses WITHOUT re-resolving — a second
+    /// lookup would reopen a DNS-rebinding window between the address policy judged
+    /// and the address dialed. The first element equals `original_dst`. Unset when
+    /// the destination is a single address (nothing to fail over to).
+    pub upstream_candidates: OnceCell<Vec<std::net::SocketAddr>>,
 }
 
 impl SocketDigest {
@@ -106,6 +113,7 @@ impl SocketDigest {
             local_addr: OnceCell::new(),
             original_dst: OnceCell::new(),
             peeked_sni: OnceCell::new(),
+            upstream_candidates: OnceCell::new(),
         }
     }
 
@@ -117,6 +125,7 @@ impl SocketDigest {
             local_addr: OnceCell::new(),
             original_dst: OnceCell::new(),
             peeked_sni: OnceCell::new(),
+            upstream_candidates: OnceCell::new(),
         }
     }
 
