@@ -473,8 +473,21 @@ where
 
         let buffer = session.as_ref().get_retry_buffer();
 
-        // retry, send buffer if it exists or body empty
-        if buffer.is_some() || session.as_mut().is_body_empty() {
+        // Retry replay, an empty body, or a body a filter already CONSUMED: all three
+        // need the single end-of-stream `request_body_filter` call made here, and the
+        // select loop below can make it for none of them — it never polls a downstream
+        // reader that is already finished, so a consumed body would simply never reach
+        // the upstream.
+        //
+        // The third case is a proxy that adapts a WHOLE request before forwarding it —
+        // the ICAP REQMOD ordering, where `request_filter` reads the body, decides, and
+        // hands the approved (possibly rewritten) body back to be released upstream.
+        // Without this it has nowhere to release it.
+        //
+        // `is_body_empty()` implies `is_body_done()` and so is subsumed by the state
+        // machine's own view; it stays spelled out because the bodyless fast path is
+        // what a reader expects to find here.
+        if buffer.is_some() || session.as_mut().is_body_empty() || downstream_state.is_done() {
             let send_permit = tx
                 .reserve()
                 .await
