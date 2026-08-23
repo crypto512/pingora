@@ -543,8 +543,21 @@ where
         #[cfg(not(feature = "early_body_buffer"))]
         let should_send_initial_body = buffer.is_some() || session.as_mut().is_body_empty();
 
-        // Send the final task for buffered empty bodies so H1 chunked framing is terminated.
-        if should_send_initial_body {
+        // Retry replay, an empty or early-buffered body (whose final task terminates H1 chunked
+        // framing), or a body a filter already CONSUMED: all of them need the single
+        // end-of-stream `request_body_filter` call made here, and the select loop below can
+        // make it for none of them — it never polls a downstream reader that is already
+        // finished, so a consumed body would simply never reach the upstream.
+        //
+        // The last case is a proxy that adapts a WHOLE request before forwarding it — the ICAP
+        // REQMOD ordering, where `request_filter` reads the body, decides, and hands the
+        // approved (possibly rewritten) body back to be released upstream. Without this it has
+        // nowhere to release it.
+        //
+        // This reads `request_body_finished`, not `downstream_state.is_done()`: a downstream
+        // abandoned during a cache fill is also "done" there with its body unfinished, and an
+        // end-of-stream here would forward that body as complete.
+        if should_send_initial_body || request_body_finished {
             let send_permit = tx
                 .reserve()
                 .await
