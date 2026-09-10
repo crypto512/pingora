@@ -35,13 +35,23 @@ pub fn prepare_tls_stream<S: IO>(ssl_acceptor: &SslAcceptor, io: S) -> Result<Ss
     SslStream::new(ssl, io).explain_err(TLSHandshakeFailure, |e| format!("ssl stream error: {e}"))
 }
 
+// The three `accept()` sites below carry the openssl error as a **cause** rather than
+// formatting it into the context string. `explain_err` calls `Error::explain`, which
+// drops the cause and keeps only its `Display` text, so a caller can no longer ask the
+// error what happened — and the answer is a peer signal worth acting on: `ErrorCode::
+// SYSCALL` is a client that vanished mid-handshake, while an `ErrorCode::SSL` whose
+// reason is `tlsv1 alert unknown ca` is a client refusing the certificate we presented.
+// Those two are one bucket without the typed error and demand opposite responses.
+// `or_err_with` keeps the cause, and `Error`'s `chain_display` still prints it, so the
+// log text is unchanged in content — only better structured.
+
 /// Perform TLS handshake for the given connection with the given configuration
 pub async fn handshake<S: IO>(ssl_acceptor: &SslAcceptor, io: S) -> Result<SslStream<S>> {
     let mut stream = prepare_tls_stream(ssl_acceptor, io)?;
     stream
         .accept()
         .await
-        .explain_err(TLSHandshakeFailure, |e| format!("TLS accept() failed: {e}"))?;
+        .or_err_with(TLSHandshakeFailure, || "TLS accept() failed")?;
     Ok(stream)
 }
 
@@ -55,7 +65,7 @@ pub async fn handshake_with_callback<S: IO>(
     let done = Pin::new(&mut tls_stream)
         .start_accept()
         .await
-        .explain_err(TLSHandshakeFailure, |e| format!("TLS accept() failed: {e}"))?;
+        .or_err_with(TLSHandshakeFailure, || "TLS accept() failed")?;
     if !done {
         // safety: we do hold a mut ref of tls_stream
         let ssl_mut = unsafe { ext::ssl_mut(tls_stream.ssl()) };
@@ -63,7 +73,7 @@ pub async fn handshake_with_callback<S: IO>(
         Pin::new(&mut tls_stream)
             .resume_accept()
             .await
-            .explain_err(TLSHandshakeFailure, |e| format!("TLS accept() failed: {e}"))?;
+            .or_err_with(TLSHandshakeFailure, || "TLS accept() failed")?;
     }
     {
         let ssl = tls_stream.ssl();
