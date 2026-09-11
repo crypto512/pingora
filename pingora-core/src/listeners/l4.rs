@@ -849,4 +849,83 @@ mod test {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
+
+    /// `IP_TRANSPARENT` is really set, on **both** address families — or the refusal
+    /// carries the errno that says why.
+    ///
+    /// This option has no unit coverage anywhere else, because enabling it needs
+    /// `CAP_NET_ADMIN` and a test suite does not have it. That is exactly what makes it
+    /// worth pinning: the setter is one `setsockopt` per family with a level and a name
+    /// that are easy to transpose (`IPPROTO_IP`/`IP_TRANSPARENT` against
+    /// `IPPROTO_IPV6`/`IPV6_TRANSPARENT`), transposing them still compiles, and the
+    /// resulting listener binds happily and then intercepts nothing — a silent failure
+    /// whose only symptom is traffic not arriving.
+    ///
+    /// So the assertion is made from the socket, not from the call's return value, and
+    /// **neither privilege level lets the test pass without asserting something**:
+    ///
+    /// * With the capability, `getsockopt` must read the option back as set. That is what
+    ///   proves the level/name pair reached the kernel correctly for that family; a
+    ///   transposed pair fails here rather than in production.
+    /// * Without it, the call must fail with `EPERM` *as the error's cause*. That is the
+    ///   other half: the errno is what separates "this box lacks `CAP_NET_ADMIN`" from
+    ///   "this kernel has no such option" (`ENOPROTOOPT`), and an error that dropped it
+    ///   makes those two identical to the operator reading the log.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ip_transparent_is_applied_to_both_families_or_explains_why_not() {
+        fn check(addr: &str, level: libc::c_int, name: libc::c_int) {
+            let addr: SocketAddr = addr.parse().unwrap();
+            let sock = match addr {
+                SocketAddr::V4(_) => TcpSocket::new_v4(),
+                SocketAddr::V6(_) => TcpSocket::new_v6(),
+            }
+            .unwrap();
+            let opt = TcpSocketOptions {
+                ip_transparent: Some(true),
+                ..Default::default()
+            };
+
+            match apply_tcp_socket_options(&sock, &addr, Some(&opt)) {
+                Ok(()) => {
+                    let mut val: libc::c_int = 0;
+                    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+                    // SAFETY: a live fd, and an out-param sized exactly as declared.
+                    let ret = unsafe {
+                        libc::getsockopt(
+                            sock.as_raw_fd(),
+                            level,
+                            name,
+                            std::ptr::from_mut(&mut val).cast(),
+                            &mut len,
+                        )
+                    };
+                    assert_eq!(0, ret, "getsockopt failed for {addr}");
+                    assert_ne!(
+                        0, val,
+                        "the option was reported set but reads back unset for {addr}"
+                    );
+                }
+                Err(e) => {
+                    // The errno must survive as a structured CAUSE, not merely as text
+                    // interpolated into the context string — `explain_err` would drop it
+                    // and still read about the same in a log line.
+                    let cause = e.root_cause();
+                    let errno = cause
+                        .downcast_ref::<std::io::Error>()
+                        .and_then(|io| io.raw_os_error());
+                    assert_eq!(
+                        Some(libc::EPERM),
+                        errno,
+                        "a refusal must carry its errno as a cause; EPERM is \"no \
+                         CAP_NET_ADMIN\" and is what distinguishes it from ENOPROTOOPT \
+                         (\"this kernel has no such option\"). Got: {e:?}"
+                    );
+                }
+            }
+        }
+
+        check("127.0.0.1:0", libc::IPPROTO_IP, libc::IP_TRANSPARENT);
+        check("[::1]:0", libc::IPPROTO_IPV6, libc::IPV6_TRANSPARENT);
+    }
 }
