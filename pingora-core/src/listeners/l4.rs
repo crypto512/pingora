@@ -225,37 +225,34 @@ fn apply_tcp_socket_options(
 
     #[cfg(target_os = "linux")]
     if let Some(transparent) = opt.ip_transparent {
-        // socket2 only provides set_ip_transparent_v4()
-        // IPv6 transparent proxy is less common and requires raw setsockopt
-        match addr {
-            SocketAddr::V4(_) => {
-                socket_ref
-                    .set_ip_transparent_v4(transparent)
-                    .or_err(BindError, "failed to set IP_TRANSPARENT (IPv4)")?;
-            }
-            SocketAddr::V6(_) => {
-                // IPv6: Use raw libc setsockopt for IPV6_TRANSPARENT
-                #[cfg(unix)]
-                {
-                    let fd = sock.as_raw_fd();
-                    let optval: libc::c_int = if transparent { 1 } else { 0 };
-                    let ret = unsafe {
-                        libc::setsockopt(
-                            fd,
-                            libc::IPPROTO_IPV6,
-                            libc::IPV6_TRANSPARENT,
-                            &optval as *const _ as *const libc::c_void,
-                            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                        )
-                    };
-                    if ret != 0 {
-                        return Err(pingora_error::Error::explain(
-                            BindError,
-                            "failed to set IPV6_TRANSPARENT",
-                        ));
-                    }
-                }
-            }
+        // Both families go through the same raw setsockopt. socket2 offers a setter for
+        // the IPv4 option only, and its name differs across the socket2 versions this
+        // crate's own requirement accepts — calling it would make whether pingora builds
+        // at all depend on which one a consumer's lockfile happens to pick.
+        let (level, name) = match addr {
+            SocketAddr::V4(_) => (libc::IPPROTO_IP, libc::IP_TRANSPARENT),
+            SocketAddr::V6(_) => (libc::IPPROTO_IPV6, libc::IPV6_TRANSPARENT),
+        };
+        let optval: libc::c_int = transparent.into();
+        // SAFETY: `sock` owns the fd for the whole call, and `optval` is a single
+        // `c_int` whose length is passed as exactly that.
+        let ret = unsafe {
+            libc::setsockopt(
+                sock.as_raw_fd(),
+                level,
+                name,
+                std::ptr::from_ref(&optval).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if ret != 0 {
+            // Keep the errno: EPERM (no CAP_NET_ADMIN) and ENOPROTOOPT (no kernel
+            // support) are different operator problems with the same message.
+            return Err(pingora_error::Error::because(
+                BindError,
+                "failed to set IP_TRANSPARENT",
+                std::io::Error::last_os_error(),
+            ));
         }
     }
 
