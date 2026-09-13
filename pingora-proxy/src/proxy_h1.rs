@@ -325,9 +325,19 @@ where
                 },
 
                 body = rx.recv(), if !request_done => {
+                    // A `Body` end can be consumed AFTER the `101`: the downstream half queues
+                    // it before it knows of the upgrade, and this `select!` is unbiased, so
+                    // whether the request body filters yielded past the `101` or both were
+                    // simply ready at once, the end may lose the race. It still ends the
+                    // HTTP/1.1 request body — `send_body_to1` writes its bytes and finishes the
+                    // body, which a chunked request needs for its terminator before the tunnel
+                    // carries anything — but it is not the upgraded client closing, so it must
+                    // not end this side of the tunnel the `101` just opened.
+                    let pre_upgrade_body_end = client_session.was_upgraded()
+                        && matches!(body, Some(HttpTask::Body(_, true)));
                     match send_body_to1(client_session, body).await {
                         Ok(send_done) => {
-                            request_done = send_done;
+                            request_done = send_done && !pre_upgrade_body_end;
                             // An upgraded request is terminated when either side is done
                             if request_done && client_session.was_upgraded() {
                                 response_done = true;
@@ -1332,5 +1342,226 @@ mod tests {
 
         assert_eq!(err.etype(), &InvalidHTTPHeader);
         assert_eq!(err.esource(), &ErrorSource::Upstream);
+    }
+
+    struct UpstreamLoopOnly;
+
+    #[async_trait]
+    impl ProxyHttp for UpstreamLoopOnly {
+        type CTX = ();
+
+        fn new_ctx(&self) -> Self::CTX {}
+
+        async fn upstream_peer(
+            &self,
+            _session: &mut Session,
+            _ctx: &mut Self::CTX,
+        ) -> Result<Box<HttpPeer>> {
+            unreachable!("the test drives proxy_handle_upstream directly")
+        }
+    }
+
+    /// How long each observation window runs. What these tests guard against ends the loop
+    /// on the very poll that consumes the late task, and the bytes they wait for are already
+    /// written into an in-memory duplex, so the window only has to outlast a few polls.
+    const WINDOW: Duration = Duration::from_millis(200);
+
+    /// What an upgraded tunnel through `proxy_handle_upstream` did after a late task arrived
+    /// from downstream.
+    #[derive(Debug, Default)]
+    struct TunnelAfterLateTask {
+        /// How the loop ended, or `None` if the tunnel was still up.
+        ended: Option<Result<bool>>,
+        /// Every byte the origin read after the request head.
+        origin_read: Vec<u8>,
+        /// Every upgraded byte the loop handed downstream.
+        downstream_got: Vec<u8>,
+    }
+
+    /// Poll the upstream loop for `window` while collecting what crosses the tunnel in both
+    /// directions. Biased toward the loop, so a deadline can never win a draw against a loop
+    /// that had already ended; and the origin read is disabled at EOF, so a closed origin
+    /// cannot starve the deadline. Returns how the loop ended, or `None` if it was still up.
+    async fn pump<F: std::future::Future<Output = Result<bool>>>(
+        mut proxied: std::pin::Pin<&mut F>,
+        rx_up: &mut mpsc::Receiver<HttpTask>,
+        origin_io: &mut tokio::io::DuplexStream,
+        seen: &mut TunnelAfterLateTask,
+        window: Duration,
+    ) -> Option<Result<bool>> {
+        use tokio::io::AsyncReadExt;
+        let deadline = tokio::time::sleep(window);
+        tokio::pin!(deadline);
+        let mut origin_eof = false;
+        let mut buf = [0u8; 1024];
+        loop {
+            tokio::select! {
+                biased;
+                ended = proxied.as_mut() => return Some(ended),
+                task = rx_up.recv() => match task {
+                    Some(HttpTask::UpgradedBody(Some(data), _)) => {
+                        seen.downstream_got.extend_from_slice(&data)
+                    }
+                    Some(_) => {}
+                    None => return Some(proxied.as_mut().await),
+                },
+                read = origin_io.read(&mut buf), if !origin_eof => match read {
+                    Ok(0) | Err(_) => origin_eof = true,
+                    Ok(n) => seen.origin_read.extend_from_slice(&buf[..n]),
+                },
+                () = &mut deadline => return None,
+            }
+        }
+    }
+
+    /// Run `proxy_handle_upstream` over an upgrade the origin accepts on the request head —
+    /// optionally a chunked request, the case whose body needs a terminator — and wait for the
+    /// `101` to leave the loop, the point at which it has already seen the upgrade. Then hand
+    /// it `late` from downstream, the way a task that lost the race arrives, and if the tunnel
+    /// is still up, send `ping` through it upstream and `pong` downstream.
+    async fn upgrade_then(chunked: bool, late: HttpTask) -> TunnelAfterLateTask {
+        use tokio::io::AsyncReadExt;
+        let proxy = HttpProxy::new(UpstreamLoopOnly, Arc::new(ServerConf::default()));
+        let (proxy_io, mut origin_io) = tokio::io::duplex(64 * 1024);
+        let mut upstream = HttpSessionV1::new(Box::new(proxy_io));
+
+        let mut req = RequestHeader::build("GET", b"/", None).unwrap();
+        req.insert_header(http::header::HOST, "example.com")
+            .unwrap();
+        req.insert_header(http::header::UPGRADE, "websocket")
+            .unwrap();
+        req.insert_header(http::header::CONNECTION, "Upgrade")
+            .unwrap();
+        if chunked {
+            req.insert_header(http::header::TRANSFER_ENCODING, "chunked")
+                .unwrap();
+        }
+        upstream.write_request_header(Box::new(req)).await.unwrap();
+
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            origin_io.read_exact(&mut byte).await.unwrap();
+            head.push(byte[0]);
+        }
+        origin_io
+            .write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+        let (tx_up, mut rx_up) = mpsc::channel::<HttpTask>(TASK_BUFFER_SIZE);
+        let (tx_down, rx_down) = mpsc::channel::<HttpTask>(TASK_BUFFER_SIZE);
+        let pipe_state = Arc::new(AtomicU8::new(PipeState::Active as u8));
+        let proxied = proxy.proxy_handle_upstream(&mut upstream, tx_up, rx_down, pipe_state);
+        tokio::pin!(proxied);
+
+        let first = tokio::select! {
+            biased;
+            ended = proxied.as_mut() => panic!("the loop ended before the 101 left it: {ended:?}"),
+            task = rx_up.recv() => task.expect("the loop delivers the response head"),
+        };
+        match first {
+            HttpTask::Header(head, _) => assert_eq!(head.status, 101),
+            other => panic!("expected the 101 head first, got {}", other.type_str()),
+        }
+
+        let mut seen = TunnelAfterLateTask::default();
+        // The control inside the harness: with nothing sent, an upgraded tunnel whose origin
+        // is silent stays up — so a loop that ends below ended because of what was sent.
+        let idle = pump(
+            proxied.as_mut(),
+            &mut rx_up,
+            &mut origin_io,
+            &mut seen,
+            WINDOW,
+        )
+        .await;
+        assert!(
+            idle.is_none(),
+            "an upgraded tunnel ended with nothing sent: {idle:?}"
+        );
+
+        tx_down.send(late).await.unwrap();
+        seen.ended = pump(
+            proxied.as_mut(),
+            &mut rx_up,
+            &mut origin_io,
+            &mut seen,
+            WINDOW,
+        )
+        .await;
+        if seen.ended.is_some() {
+            return seen;
+        }
+
+        tx_down
+            .send(HttpTask::UpgradedBody(
+                Some(Bytes::from_static(b"ping")),
+                false,
+            ))
+            .await
+            .unwrap();
+        origin_io.write_all(b"pong").await.unwrap();
+        seen.ended = pump(
+            proxied.as_mut(),
+            &mut rx_up,
+            &mut origin_io,
+            &mut seen,
+            WINDOW,
+        )
+        .await;
+        seen
+    }
+
+    /// A bodyless upgrade request finishes its request body at once, so the downstream half
+    /// queues `Body(None, true)` before it knows of the upgrade, and that task can be consumed
+    /// after the `101`. It ends a request body, not the upgraded client: the tunnel the `101`
+    /// opened must stay up and carry bytes both ways.
+    #[tokio::test]
+    async fn a_pre_upgrade_end_of_body_does_not_end_the_upgraded_tunnel() {
+        let seen = upgrade_then(false, HttpTask::Body(None, true)).await;
+        assert!(
+            seen.ended.is_none(),
+            "a pre-upgrade end-of-body consumed after the 101 ended the tunnel: {seen:?}"
+        );
+        assert_eq!(seen.origin_read, b"ping", "{seen:?}");
+        assert_eq!(seen.downstream_got, b"pong", "{seen:?}");
+    }
+
+    /// The same late end on a CHUNKED upgrade request carries the request body's last chunk,
+    /// and ending that body is still owed: the terminator must reach the origin before the
+    /// first tunnel byte, or the origin reads the tunnel as the next chunk-size line.
+    #[tokio::test]
+    async fn a_late_chunked_body_end_is_terminated_before_the_tunnel_carries_bytes() {
+        let seen = upgrade_then(
+            true,
+            HttpTask::Body(Some(Bytes::from_static(b"hello")), true),
+        )
+        .await;
+        assert!(
+            seen.ended.is_none(),
+            "a late chunked end ended the tunnel: {seen:?}"
+        );
+        assert_eq!(
+            seen.origin_read,
+            b"5\r\nhello\r\n0\r\n\r\nping",
+            "the chunked body must be terminated before the tunnel bytes: {:?}",
+            String::from_utf8_lossy(&seen.origin_read)
+        );
+        assert_eq!(seen.downstream_got, b"pong", "{seen:?}");
+    }
+
+    /// The positive control for both tests above: the upgraded client's own end — an
+    /// `UpgradedBody` end — does end the tunnel, so "still up" there is the late task's effect
+    /// and not a loop that cannot end.
+    #[tokio::test]
+    async fn an_upgraded_end_of_body_ends_the_tunnel() {
+        let seen = upgrade_then(false, HttpTask::UpgradedBody(None, true)).await;
+        assert!(
+            seen.ended.is_some(),
+            "the upgraded client's own end must end the tunnel: {seen:?}"
+        );
     }
 }
