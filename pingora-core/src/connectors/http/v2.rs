@@ -536,6 +536,30 @@ const H2_WINDOW_SIZE: u32 = 1 << 23;
 /// Maximum allowed H2 window size per [RFC 9113 §6.9.1](https://datatracker.ietf.org/doc/html/rfc9113#section-6.9.1-7).
 const H2_MAX_WINDOW_SIZE: u32 = (1u32 << 31) - 1;
 
+// The value advertised as SETTINGS_MAX_HEADER_LIST_SIZE. It bounds a response head twice, and
+// the second is where the memory actually is:
+//
+//   - the decoded list: at this size h2 marks the block over-size and discards every further
+//     field rather than storing it, so the header map peaks at about this value;
+//   - the compressed wire: `calc_max_continuation_frames` derives the CONTINUATION budget from
+//     this setting and the frame size, and an HPACK literal spanning frames must accumulate
+//     whole before any of it can be decoded. Against the 64 KiB frames advertised above, this
+//     setting allows 20 CONTINUATION frames — ~1.4 MiB once the HEADERS frame and the final
+//     one are counted — where h2's own 16 MiB default allows 320, or ~20 MiB, on a path where
+//     the peer alone chooses how much to send. Overrunning the budget is a connection-level
+//     GOAWAY, so it ends every stream on the connection and not just the offending one.
+//
+// This is the number h1 uses, not an equivalent of it. h2 charges a field 28 bytes more than
+// the wire does — name + value + 32 against name + value + 4 — so at an equal limit h2 is
+// always the stricter of the two, and a head that exactly fills h1's allowance is refused
+// here. A real response head is a few KB, so the divergence is theoretical; what matters is
+// that it runs one way only, and the strict side is the safe side to be wrong on.
+//
+// A pure memory bound with no behaviour to trade off, so it is a const rather than an
+// `H2HandshakeSettings` field: the window sizes are settings because a deployment sizes those
+// against its own memory budget, and this one has a single right answer.
+const H2_MAX_HEADER_LIST_SIZE: u32 = 1 << 20;
+
 /// Settings for HTTP/2 handshake.
 ///
 /// # Example
@@ -629,6 +653,7 @@ pub async fn handshake(stream: Stream, settings: H2HandshakeSettings) -> Result<
         // The limit for the server. Server push is not allowed, so this value doesn't matter
         .max_concurrent_streams(1)
         .max_frame_size(64 * 1024) // advise server to send larger frames
+        .max_header_list_size(H2_MAX_HEADER_LIST_SIZE)
         .initial_window_size(stream_window)
         .initial_connection_window_size(conn_window)
         .handshake(stream)
@@ -1027,6 +1052,56 @@ mod tests {
             ),
             Ok(_) => panic!("Expected error for connection_window_size > max"),
         }
+    }
+
+    /// The handshake must advertise a bounded `SETTINGS_MAX_HEADER_LIST_SIZE` rather than leave
+    /// h2's 16 MiB default, which also decides the CONTINUATION budget. The frame is the only
+    /// place the value is observable — a builder call leaves no other trace — and it is read
+    /// with h2's own codec rather than a hand-rolled parser, mirroring `advertised_settings` on
+    /// the server side of this same setting.
+    ///
+    /// `handshake` writes only the preface and returns; the SETTINGS frame is buffered and
+    /// flushed by the `drive_connection` task it spawns, so the read below races that task and
+    /// not the handshake future. Both waits are bounded, because `#[tokio::test]` has no timeout
+    /// of its own: an edit that returns before that spawn should fail here, not hang the gate.
+    #[tokio::test]
+    async fn test_h2_handshake_advertises_bounded_header_list_size() {
+        use h2::frame::Frame;
+        use tokio::io::{AsyncReadExt, DuplexStream};
+        use tokio_stream::StreamExt;
+
+        const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        let bounded = Duration::from_secs(10);
+
+        let (client, mut server) = tokio::io::duplex(65536);
+        let mut settings = H2HandshakeSettings::new();
+        settings.max_streams = 100;
+        let handshake = tokio::spawn(handshake(Box::new(client), settings));
+
+        // The preface is not a frame, so it comes off the stream before the codec sees it.
+        let mut preface = [0u8; 24];
+        tokio::time::timeout(bounded, server.read_exact(&mut preface))
+            .await
+            .expect("the client preface is written")
+            .unwrap();
+        assert_eq!(preface, PREFACE);
+
+        let mut codec: h2::Codec<DuplexStream, Bytes> = h2::Codec::new(server);
+        let frame = tokio::time::timeout(bounded, codec.next())
+            .await
+            .expect("the SETTINGS frame is flushed")
+            .expect("the connection is still open")
+            .unwrap();
+        let Frame::Settings(advertised) = frame else {
+            panic!("expected SETTINGS, received {frame:?}");
+        };
+
+        assert_eq!(
+            advertised.max_header_list_size(),
+            Some(H2_MAX_HEADER_LIST_SIZE),
+            "the connector must advertise a header-list limit, not leave h2's 16 MiB default"
+        );
+        handshake.await.unwrap().expect("the handshake succeeds");
     }
 
     #[tokio::test]
