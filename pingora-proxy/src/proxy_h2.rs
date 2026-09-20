@@ -459,17 +459,20 @@ where
                     return Err(e);
                 }
             }
-            filtered_tasks.push(
-                self.h2_response_filter(
+            // streamscope: `ahead` is how the trailer arm writes a body it ended (see
+            // `h2_response_filter`) before the trailer block that ended it.
+            let filtered = self
+                .h2_response_filter(
                     session,
                     t,
                     ctx,
                     serve_from_cache,
                     range_body_filter,
                     false,
+                    &mut filtered_tasks,
                 )
-                .await?,
-            );
+                .await?;
+            filtered_tasks.push(filtered);
             if serve_from_cache.is_miss_header() {
                 response_state.enable_cached_response();
             }
@@ -752,15 +755,22 @@ where
                         && serve_from_cache.is_on()
                         && !session.has_pending_downstream_tasks() => { // backpressure: don't queue if pending writes
 
+                    // streamscope: `ahead` carries a body the trailer arm ended, which
+                    // goes out before the task that ended it. A cached response replays
+                    // no trailers, so this stays empty — it is passed, not assumed empty.
+                    let mut tasks = Vec::with_capacity(1);
                     let task = self.h2_response_filter(session, task?, ctx,
                         &mut serve_from_cache,
-                        &mut range_body_filter, true).await?;
+                        &mut range_body_filter, true, &mut tasks).await?;
                     debug!("serve_from_cache task {task:?}");
+                    tasks.push(task);
 
                     if session.downstream_session.supports_proxy_task_api() {
-                        session.send_downstream_proxy_task(task).await?;
+                        for task in tasks {
+                            session.send_downstream_proxy_task(task).await?;
+                        }
                     } else {
-                        match session.write_response_tasks(vec![task]).await {
+                        match session.write_response_tasks(tasks).await {
                             Ok(b) => response_state.maybe_set_cache_done(b),
                             Err(e) => if serve_from_cache.is_miss() {
                                 // give up writing to downstream but wait for upstream cache write to finish
@@ -923,6 +933,51 @@ where
         Ok(reuse_downstream)
     }
 
+    /// streamscope: give [`ProxyHttp::response_body_filter`] its end-of-stream before an
+    /// HTTP/2 response's trailer block, and carry back whatever it releases.
+    ///
+    /// An h2 response that ends in trailers carries END_STREAM on the trailer HEADERS
+    /// frame, so [`check_response_end_or_error`](pingora_core::protocols::http::v2::client::Http2Session::check_response_end_or_error)
+    /// answers `false` for every DATA frame and the upstream half emits no
+    /// `HttpTask::Body(_, true)`. A filter that withholds a body and releases it at
+    /// end-of-stream — a RESPMOD content scan — would never reach its release, so the
+    /// response is delivered as a head with no bytes at all.
+    ///
+    /// A `Trailer` task is exactly the case where the end-of-stream is still owed: a body
+    /// that ended with END_STREAM on a DATA frame has no trailers to read, so the upstream
+    /// half sends `Trailer` only when no body task carried the end.
+    ///
+    /// The released bytes are returned as a task the caller writes AHEAD of the trailers,
+    /// carrying `false` for the end — the trailer task that follows is the end of the
+    /// response — so a gRPC `grpc-status` still reaches the client.
+    ///
+    /// Called from the `Trailer` arm of [`Self::h2_response_filter`], which is past the
+    /// upstream filters and past the cache-admission return: a task the downstream half
+    /// never sees must not reach the app's body filter either.
+    async fn end_response_body_before_trailers(
+        &self,
+        session: &mut Session<DS>,
+        ctx: &mut <SV as ProxyHttp<DS>>::CTX,
+    ) -> Result<Option<HttpTask>>
+    where
+        SV: ProxyHttp<DS> + Send + Sync,
+        <SV as ProxyHttp<DS>>::CTX: Send + Sync,
+    {
+        let mut body = None;
+        if let Some(duration) = self
+            .inner
+            .response_body_filter(session, &mut body, true, ctx)
+            .await?
+        {
+            trace!("delaying downstream response for {duration:?}");
+            time::sleep(duration).await;
+        }
+        Ok(body.map(|b| HttpTask::Body(Some(b), false)))
+    }
+
+    // reason: the driver's per-task state, plus `ahead` — splitting it into a struct would
+    // touch every caller of an upstream function for no behavioural gain.
+    #[allow(clippy::too_many_arguments)]
     async fn h2_response_filter(
         &self,
         session: &mut Session<DS>,
@@ -931,6 +986,9 @@ where
         serve_from_cache: &mut ServeFromCache,
         range_body_filter: &mut RangeBodyFilter,
         from_cache: bool, // are the task from cache already
+        // streamscope: tasks to write BEFORE the filtered one. A trailer block ends a
+        // body the filter had withheld, and those bytes precede it on the wire.
+        ahead: &mut Vec<HttpTask>,
     ) -> Result<HttpTask>
     where
         SV: ProxyHttp<DS> + Send + Sync,
@@ -1039,6 +1097,12 @@ where
                 panic!("Unexpected UpgradedBody task while proxy h2");
             }
             HttpTask::Trailer(mut trailers) => {
+                // streamscope: this block is the response's end-of-stream, and the body
+                // filter was never given one (see `end_response_body_before_trailers`).
+                if let Some(released) = self.end_response_body_before_trailers(session, ctx).await?
+                {
+                    ahead.push(released);
+                }
                 let trailer_buffer = match trailers.as_mut() {
                     Some(trailers) => {
                         debug!("Parsing response trailers..");
@@ -1435,5 +1499,173 @@ fn test_h2_path_is_rooted_for_targets_with_no_authority() {
             header.uri.authority().map(|authority| authority.as_str()),
             "{label}"
         );
+    }
+}
+
+#[cfg(test)]
+mod trailered_response_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A filter shaped like a RESPMOD content scan: withhold every chunk, release the
+    /// whole body at end-of-stream. It is the shape that a missing end-of-stream costs
+    /// the entire response body.
+    struct WithholdUntilEnd {
+        withheld: Mutex<Vec<u8>>,
+        ends: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ProxyHttp for WithholdUntilEnd {
+        type CTX = ();
+
+        fn new_ctx(&self) -> Self::CTX {}
+
+        async fn upstream_peer(
+            &self,
+            _session: &mut Session,
+            _ctx: &mut Self::CTX,
+        ) -> Result<Box<HttpPeer>> {
+            unreachable!("the test drives the downstream task batch directly")
+        }
+
+        async fn response_body_filter(
+            &self,
+            _session: &mut Session,
+            body: &mut Option<Bytes>,
+            end_of_stream: bool,
+            _ctx: &mut Self::CTX,
+        ) -> Result<Option<Duration>> {
+            if let Some(chunk) = body.take() {
+                self.withheld
+                    .lock()
+                    .expect("test mutex")
+                    .extend_from_slice(&chunk);
+            }
+            if end_of_stream {
+                self.ends.fetch_add(1, Ordering::Relaxed);
+                let released = std::mem::take(&mut *self.withheld.lock().expect("test mutex"));
+                if !released.is_empty() {
+                    *body = Some(Bytes::from(released));
+                }
+            }
+            Ok(None)
+        }
+    }
+
+    async fn session_with_request() -> (tokio::io::DuplexStream, Session) {
+        let (mut client, server) = tokio::io::duplex(8192);
+        client
+            .write_all(b"GET /rpc HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .expect("test request should be written");
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        session
+            .read_request()
+            .await
+            .expect("test request should parse");
+        (client, session)
+    }
+
+    /// Read the client's side to EOF. The caller drops the `Session` first, so the server
+    /// half closes and this ends on a real end-of-file rather than on a deadline — a test
+    /// that waits out a timeout hides the difference between "wrote nothing" and "is slow".
+    async fn downstream_bytes(client: &mut tokio::io::DuplexStream) -> String {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 1024];
+        while let Ok(read) = client.read(&mut buf).await {
+            if read == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..read]);
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// Runs one batch of upstream tasks through the downstream half and returns what the
+    /// client was written, with the number of end-of-streams the body filter was given.
+    async fn one_batch(tasks: Vec<HttpTask>) -> (String, usize) {
+        let proxy = HttpProxy::new(
+            WithholdUntilEnd {
+                withheld: Mutex::new(Vec::new()),
+                ends: AtomicUsize::new(0),
+            },
+            Arc::new(ServerConf::default()),
+        );
+        let (mut client, mut session) = session_with_request().await;
+
+        let (tx, mut rx) = mpsc::channel(tasks.len());
+        let mut tasks = tasks.into_iter();
+        let initial = tasks.next().expect("a batch starts with a task");
+        for task in tasks {
+            tx.send(task).await.expect("test task queued");
+        }
+        drop(tx); // so the batch loop sees the end of the pipe rather than parking
+
+        proxy
+            .process_upstream_tasks_h2(
+                &mut session,
+                &mut (),
+                initial,
+                &mut rx,
+                &mut ServeFromCache::new(),
+                &mut RangeBodyFilter::new(),
+                &mut ResponseStateMachine::new(),
+            )
+            .await
+            .expect("the batch should reach the downstream");
+        drop(session); // close the server half so the read below ends at EOF
+
+        (
+            downstream_bytes(&mut client).await,
+            proxy.inner.ends.load(Ordering::Relaxed),
+        )
+    }
+
+    fn head() -> HttpTask {
+        HttpTask::Header(
+            Box::new(ResponseHeader::build(200, None).expect("test response header")),
+            false,
+        )
+    }
+
+    /// The control: a response whose last DATA frame carries END_STREAM gives the body
+    /// filter its end with that chunk, and the withheld body is released.
+    #[tokio::test]
+    async fn a_response_without_trailers_ends_the_body_filter_on_its_last_chunk() {
+        let (wire, ends) = one_batch(vec![
+            head(),
+            HttpTask::Body(Some(Bytes::from_static(b"hello")), true),
+            HttpTask::Done,
+        ])
+        .await;
+
+        assert_eq!(ends, 1, "the last chunk must end the body filter");
+        assert!(
+            wire.contains("hello"),
+            "the withheld body must reach the client: {wire:?}"
+        );
+    }
+
+    /// A response that ends in trailers carries END_STREAM on the trailer block, so no
+    /// body task carries the end. Without an end-of-stream before the trailers the
+    /// withheld body is dropped and the client is served a head with no bytes.
+    #[tokio::test]
+    async fn a_trailered_response_ends_the_body_filter_before_its_trailers() {
+        let (wire, ends) = one_batch(vec![
+            head(),
+            HttpTask::Body(Some(Bytes::from_static(b"hello")), false),
+            HttpTask::Trailer(Some(Box::new(http::HeaderMap::new()))),
+            HttpTask::Done,
+        ])
+        .await;
+
+        assert!(
+            wire.contains("hello"),
+            "the withheld body must be released ahead of the trailers: {wire:?}"
+        );
+        assert_eq!(ends, 1, "the trailer block must end the body filter");
     }
 }
