@@ -1199,6 +1199,20 @@ pub struct Server {
 
 impl Server {
     pub fn start() -> Self {
+        // The readiness probe below is "something accepts on 6147", which a server left
+        // over from an aborted run satisfies at once. The listeners this run then fails
+        // to bind only log and retry, so every request is answered by THAT server —
+        // another build, maybe another test binary's app — and tests fail as wrong
+        // behaviour with no bind error anywhere. So the port must be free first.
+        // (`TcpListener::bind` sets SO_REUSEADDR, so only a live listener refuses it.)
+        if let Err(e) = std::net::TcpListener::bind("0.0.0.0:6147") {
+            panic!(
+                "port 6147 is already held ({e}): a test server from an earlier run is \
+                 still alive and would answer this run's requests. Find it with \
+                 `ss -ltnp | grep 6147` (Linux) or `sockstat -l4 -p 6147` (FreeBSD)."
+            );
+        }
+
         let server_handle = thread::spawn(|| {
             test_main();
         });
