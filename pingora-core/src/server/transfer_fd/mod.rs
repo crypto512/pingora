@@ -491,33 +491,61 @@ mod tests {
 
     /// How many fds in this process refer to a unix socket bound to `path`.
     ///
-    /// Reads the socket inodes bound to `path` from /proc/net/unix, then scans
-    /// /proc/self/fd for descriptors pointing at them. Filtering by path keeps this
-    /// unaffected by unrelated descriptors opened by tests running in parallel.
+    /// Asks every open descriptor for its own bound address (`getsockname`) rather than
+    /// reading a kernel table, so it holds on any unix — a listener and the connections
+    /// accepted from it all report the path the listener bound. Filtering by path keeps
+    /// this unaffected by unrelated descriptors opened by tests running in parallel.
     fn unix_socket_fds_bound_to(path: &str) -> usize {
-        let unix = std::fs::read_to_string("/proc/net/unix").unwrap();
-        let inodes: HashSet<&str> = unix
-            .lines()
-            .filter_map(|line| {
-                let mut cols = line.split_whitespace();
-                let inode = cols.nth(6)?;
-                (cols.next() == Some(path)).then_some(inode)
-            })
-            .collect();
-        if inodes.is_empty() {
-            return 0;
-        }
-        std::fs::read_dir("/proc/self/fd")
-            .unwrap()
-            .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
-            .filter(|target| {
-                target
-                    .to_str()
-                    .and_then(|t| t.strip_prefix("socket:["))
-                    .and_then(|t| t.strip_suffix(']'))
-                    .is_some_and(|inode| inodes.contains(inode))
+        let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+        // SAFETY: `getrlimit` fills `limit` for a valid resource id; read after a 0 return.
+        let max_fd = unsafe {
+            assert_eq!(0, libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()));
+            limit.assume_init().rlim_cur
+        };
+        (0..max_fd as RawFd)
+            .filter(|&fd| {
+                // SAFETY: a zeroed `sockaddr_un` is a valid out-buffer of the length
+                // passed; a descriptor that is closed or not a socket fails the call.
+                let (rc, addr) = unsafe {
+                    let mut addr: libc::sockaddr_un = std::mem::zeroed();
+                    let mut len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+                    let rc = libc::getsockname(fd, std::ptr::from_mut(&mut addr).cast(), &mut len);
+                    (rc, addr)
+                };
+                if rc != 0 || addr.sun_family as libc::c_int != libc::AF_UNIX {
+                    return false;
+                }
+                let bound: Vec<u8> = addr
+                    .sun_path
+                    .iter()
+                    .take_while(|&&c| c != 0)
+                    .map(|&c| c as u8)
+                    .collect();
+                bound == path.as_bytes()
             })
             .count()
+    }
+
+    /// The leak test below asserts a count of ZERO, which a counter that sees nothing
+    /// also returns. This is its positive control: a listener and a connection accepted
+    /// from it are both found, and neither outlives its owner.
+    #[test]
+    fn test_unix_socket_fds_are_counted_while_open() {
+        const SOCK: &str = "/tmp/pingora_fds_counted.sock";
+        let _ = std::fs::remove_file(SOCK);
+
+        let listener = std::os::unix::net::UnixListener::bind(SOCK).unwrap();
+        assert_eq!(1, unix_socket_fds_bound_to(SOCK));
+
+        let _client = std::os::unix::net::UnixStream::connect(SOCK).unwrap();
+        let (accepted, _) = listener.accept().unwrap();
+        assert_eq!(2, unix_socket_fds_bound_to(SOCK));
+
+        drop(accepted);
+        assert_eq!(1, unix_socket_fds_bound_to(SOCK));
+        drop(listener);
+        assert_eq!(0, unix_socket_fds_bound_to(SOCK));
+        let _ = std::fs::remove_file(SOCK);
     }
 
     #[test]

@@ -109,9 +109,13 @@ pub struct TcpSocketOptions {
     /// Specifies the server should set the following DSCP value on outgoing connections.
     /// See the [RFC](https://datatracker.ietf.org/doc/html/rfc2474) for more details.
     pub dscp: Option<u8>,
-    /// Enable SO_REUSEPORT to allow multiple sockets to bind to the same address and port.
-    /// This is useful for load balancing across multiple worker processes.
-    /// See the [man page](https://man7.org/linux/man-pages/man7/socket.7.html) for more information.
+    /// Let multiple sockets bind the same address and port, with the kernel spreading new
+    /// connections across them — what load balancing across worker processes needs.
+    ///
+    /// That is `SO_REUSEPORT` on Linux
+    /// ([man page](https://man7.org/linux/man-pages/man7/socket.7.html)) and
+    /// `SO_REUSEPORT_LB` on FreeBSD, where plain `SO_REUSEPORT` permits the shared bind
+    /// but hands every connection to one of the sockets.
     pub so_reuseport: Option<bool>,
     /// Set the send buffer size for accepted connections. See
     /// [SO_SNDBUF](https://man7.org/linux/man-pages/man7/socket.7.html).
@@ -194,6 +198,28 @@ mod uds {
     }
 }
 
+/// `SO_REUSEPORT_LB`: the shared bind **and** the kernel spreading new connections
+/// across the sockets sharing it. Plain `SO_REUSEPORT` gives only the first half here.
+#[cfg(target_os = "freebsd")]
+fn set_reuse_port_lb(sock: &TcpSocket, on: bool) -> std::io::Result<()> {
+    let val: libc::c_int = on.into();
+    // SAFETY: `sock` owns the fd for the call; `val` and its size are the argument
+    // shape `setsockopt` documents for a boolean option.
+    let rc = unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_REUSEPORT_LB,
+            std::ptr::from_ref(&val).cast(),
+            std::mem::size_of_val(&val) as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 // currently, these options can only apply on sockets prior to calling bind()
 fn apply_tcp_socket_options(
     sock: &TcpSocket,
@@ -216,11 +242,16 @@ fn apply_tcp_socket_options(
             .or_err(BindError, "failed to set IPV6_V6ONLY")?;
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "freebsd")))]
     if let Some(reuseport) = opt.so_reuseport {
         socket_ref
             .set_reuse_port(reuseport)
             .or_err(BindError, "failed to set SO_REUSEPORT")?;
+    }
+
+    #[cfg(target_os = "freebsd")]
+    if let Some(reuseport) = opt.so_reuseport {
+        set_reuse_port_lb(sock, reuseport).or_err(BindError, "failed to set SO_REUSEPORT_LB")?;
     }
 
     #[cfg(target_os = "linux")]
@@ -671,6 +702,54 @@ mod test {
         // Both listeners should be able to bind to the same address
         assert_eq!(listener1.as_str(), addr);
         assert_eq!(listener2.as_str(), addr);
+    }
+
+    /// Sharing the port is only half of what `so_reuseport` is for: the kernel has to
+    /// spread connections across the sockets too. A platform whose option permits the
+    /// bind and then feeds one socket passes the test above and starves every process
+    /// but one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_tcp_so_reuseport_spreads_connections() {
+        const CONNECTIONS: usize = 64;
+        let addr = "127.0.0.1:7203";
+        let sock_opt = TcpSocketOptions {
+            so_reuseport: Some(true),
+            ..Default::default()
+        };
+
+        let mut listeners = Vec::new();
+        for _ in 0..2 {
+            let mut builder = ListenerEndpoint::builder();
+            builder.listen_addr(ServerAddress::Tcp(addr.into(), Some(sock_opt.clone())));
+            listeners.push(builder.listen(None).await.unwrap());
+        }
+
+        // Held open until the count is taken, so nothing is reset out of a queue.
+        let mut clients = Vec::with_capacity(CONNECTIONS);
+        for _ in 0..CONNECTIONS {
+            clients.push(tokio::net::TcpStream::connect(addr).await.unwrap());
+        }
+
+        let mut accepted = [0usize; 2];
+        for (count, listener) in accepted.iter_mut().zip(&listeners) {
+            while tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_ok_and(|stream| stream.is_ok())
+            {
+                *count += 1;
+            }
+        }
+
+        assert_eq!(
+            accepted.iter().sum::<usize>(),
+            CONNECTIONS,
+            "every connection reaches one of the listeners, got {accepted:?}"
+        );
+        assert!(
+            accepted.iter().all(|&n| n > 0),
+            "connections must be spread across the sockets sharing the port, got {accepted:?}"
+        );
     }
 
     #[tokio::test]

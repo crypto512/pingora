@@ -38,7 +38,37 @@ use tokio::net::{TcpSocket, TcpStream};
 
 use crate::connectors::l4::BindTo;
 
+/// FreeBSD's `struct tcp_info`. It shares Linux's name and a few field names and
+/// nothing else: the layout differs, several Linux fields do not exist
+/// (`tcpi_data_segs_out`, the byte counters), and **the time fields are microseconds**
+/// where Linux reports milliseconds. The kernel's own declaration is used rather than a
+/// copy, and its fields are read through `Deref`.
+#[cfg(target_os = "freebsd")]
+#[repr(transparent)]
+#[derive(Copy, Clone)]
+pub struct TCP_INFO(pub libc::tcp_info);
+
+#[cfg(target_os = "freebsd")]
+impl std::ops::Deref for TCP_INFO {
+    type Target = libc::tcp_info;
+    fn deref(&self) -> &libc::tcp_info {
+        &self.0
+    }
+}
+
+#[cfg(target_os = "freebsd")]
+impl std::fmt::Debug for TCP_INFO {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TCP_INFO")
+            .field("tcpi_state", &self.0.tcpi_state)
+            .field("tcpi_rtt", &self.0.tcpi_rtt)
+            .field("tcpi_last_data_recv", &self.0.tcpi_last_data_recv)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The (copy of) the kernel struct tcp_info returns
+#[cfg(not(target_os = "freebsd"))]
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct TCP_INFO {
@@ -325,12 +355,16 @@ fn set_keepalive(_sock: RawSocket, _ka: &TcpKeepalive) -> io::Result<()> {
 }
 
 /// Get the kernel TCP_INFO for the given FD.
-#[cfg(target_os = "linux")]
+///
+/// Each kernel answers in its **own** layout — see [`TCP_INFO`] — and `get_opt_sized`
+/// refuses an answer of any other size, so a struct that has drifted from the running
+/// kernel's is an error rather than misread fields.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub fn get_tcp_info(fd: RawFd) -> io::Result<TCP_INFO> {
     get_opt_sized(fd, libc::IPPROTO_TCP, libc::TCP_INFO)
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "freebsd"))))]
 pub fn get_tcp_info(_fd: RawFd) -> io::Result<TCP_INFO> {
     Ok(unsafe { TCP_INFO::new() })
 }
@@ -1119,5 +1153,35 @@ mod test {
         )
         .unwrap();
         assert!(!ip_local_port_range(sock.as_raw_fd(), 0, 0).unwrap());
+    }
+
+    /// The reading a caller takes off a connection it has not looked at yet: how long
+    /// what the peer sent has been waiting. Both kernels answer it under the same field
+    /// name and in different units, which is the whole reason the type is per platform —
+    /// a Linux-layout read of the other kernel's struct returns a plausible number.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    #[test]
+    fn tcp_info_reports_how_long_unread_data_has_waited() {
+        use std::io::Write;
+
+        const WAITED: Duration = Duration::from_millis(300);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client.write_all(b"hello").unwrap();
+        std::thread::sleep(WAITED);
+        let (accepted, _) = listener.accept().unwrap();
+
+        let info = get_tcp_info(accepted.as_raw_fd()).unwrap();
+        #[cfg(target_os = "linux")]
+        let waited = Duration::from_millis(info.tcpi_last_data_recv.into());
+        #[cfg(target_os = "freebsd")]
+        let waited = Duration::from_micros(info.tcpi_last_data_recv.into());
+
+        // A tick short of the sleep at most (the kernel counts in ticks), and nowhere
+        // near what the other unit would read: 300 s, or 0.3 ms.
+        assert!(
+            waited >= WAITED - Duration::from_millis(50) && waited < WAITED * 10,
+            "data unread for {WAITED:?} reads as {waited:?}"
+        );
     }
 }
