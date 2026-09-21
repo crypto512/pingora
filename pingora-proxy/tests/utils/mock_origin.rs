@@ -53,6 +53,23 @@ fn init() -> bool {
         .spawn()
         .unwrap()
         .wait();
+
+    // The kill above reaches only an origin whose pid file survived. One whose pid file
+    // is gone (a /tmp cleaner is enough) keeps port 8000, the origin started below fails
+    // to bind and exits, and the readiness probe is satisfied by the OLD one — serving
+    // whatever nginx.conf it was started with, for as long as the machine stays up. So
+    // the port must actually be free, allowing the killed origin a moment to let go.
+    let freed = time::Instant::now() + time::Duration::from_secs(5);
+    while let Err(e) = std::net::TcpListener::bind("0.0.0.0:8000") {
+        assert!(
+            time::Instant::now() < freed,
+            "port 8000 is still held ({e}): a mock origin from an earlier run is alive and \
+             would answer this run with its own, possibly older, nginx.conf. Find it with \
+             `ss -ltnp | grep 8000` (Linux) or `sockstat -l4 -p 8000` (FreeBSD)."
+        );
+        thread::sleep(time::Duration::from_millis(50));
+    }
+
     let _origin = thread::spawn(|| {
         process::Command::new("openresty")
             .args(["-p", &format!("{}/origin", super::conf_dir())])

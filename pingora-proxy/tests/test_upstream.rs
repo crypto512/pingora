@@ -5513,7 +5513,7 @@ mod test_cache {
         let epoch2 = headers["x-epoch"].clone();
         assert_eq!(headers["x-cache-status"], "no-cache");
         assert_eq!(res.text().await.unwrap(), "hello world");
-        assert!(epoch1 != epoch2);
+        assert_ne!(epoch1, epoch2, "two trips to the origin carry two epochs");
     }
 
     #[tokio::test]
