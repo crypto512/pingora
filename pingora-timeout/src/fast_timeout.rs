@@ -184,6 +184,33 @@ mod tests {
         assert!(to.await.is_err())
     }
 
+    /// A timeout may end late by the timer's resolution. It must never end EARLY: a
+    /// caller that waits `d` for something has promised `d`, and "refused at the
+    /// deadline" 0.9 ms before the deadline is a refusal the deadline did not make.
+    ///
+    /// The start times are spread across the millisecond on purpose. Whether a timeout
+    /// could end early depended on the sub-millisecond part of `now + d`, so timeouts
+    /// that all start on the same fraction all behave alike and prove nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_a_timeout_never_ends_before_its_duration() {
+        const WAIT: Duration = Duration::from_millis(30);
+        let waits: Vec<_> = (0..200u64)
+            .map(|i| {
+                tokio::spawn(async move {
+                    tokio_sleep(Duration::from_micros(i * 137)).await;
+                    let started = std::time::Instant::now();
+                    let timed_out = fast_timeout(WAIT, std::future::pending::<()>()).await;
+                    assert!(timed_out.is_err());
+                    started.elapsed()
+                })
+            })
+            .collect();
+        for wait in waits {
+            let waited = wait.await.unwrap();
+            assert!(waited >= WAIT, "a {WAIT:?} timeout ended after {waited:?}");
+        }
+    }
+
     #[tokio::test]
     async fn test_instantly_return() {
         let fut = async { 1 };
