@@ -55,8 +55,16 @@ impl From<u128> for Time {
 }
 
 impl From<Duration> for Time {
+    // The fraction of a millisecond is rounded UP before the key is bucketed.
+    // `as_millis()` truncates it, and the clock thread fires a key once its own whole
+    // milliseconds reach it — so a deadline of 1030.9 ms keyed at 1030 fires up to a
+    // millisecond before it is due. A timeout may run late by the resolution; it must
+    // never end early.
     fn from(d: Duration) -> Self {
-        Time(round_to(d.as_millis(), RESOLUTION_MS as u128))
+        Time(round_to(
+            d.as_nanos().div_ceil(1_000_000),
+            RESOLUTION_MS as u128,
+        ))
     }
 }
 
@@ -264,6 +272,29 @@ mod tests {
         assert!(!t.not_after(129));
         assert!(t.not_after(130));
         assert!(t.not_after(131));
+    }
+
+    /// A timer is keyed in whole milliseconds and fired once the clock's whole
+    /// milliseconds reach the key, so the key must never be EARLIER than the deadline it
+    /// stands for. A deadline of 30.9 ms that keys at 30 fires 0.9 ms before it is due:
+    /// a wait that ends before the time it promised.
+    #[test]
+    fn test_time_never_precedes_its_deadline() {
+        for micros in [30_000u64, 30_001, 30_900, 30_999, 39_999, 40_000, 40_001] {
+            let deadline = Duration::from_micros(micros);
+            let key: Time = deadline.into();
+            assert!(
+                Duration::from_millis(key.0 as u64) >= deadline,
+                "a deadline of {deadline:?} keys at {} ms, before it is due",
+                key.0
+            );
+            // …and no later than the resolution allows.
+            assert!(
+                Duration::from_millis(key.0 as u64) < deadline + RESOLUTION_DURATION,
+                "a deadline of {deadline:?} keys at {} ms, more than one step late",
+                key.0
+            );
+        }
     }
 
     #[tokio::test]
