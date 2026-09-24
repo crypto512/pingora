@@ -783,17 +783,25 @@ async fn inner_connect_with<F: FnOnce(&TcpSocket) -> Result<()>>(
             }
 
             if let Some(baddr) = bind_to.addr {
-                // SO_REUSEADDR before bind(): for fully-transparent proxying the
-                // upstream socket binds the client's *exact* source ip:port, so a
-                // recently-closed upstream connection lingering in TIME_WAIT for
-                // that same local address would otherwise make bind() fail with
-                // EADDRINUSE under connection churn. SO_REUSEADDR permits rebinding
-                // a TIME_WAIT-held local address; it does NOT let two live sockets
-                // share an identical 4-tuple, so genuine active collisions still
-                // error as before.
-                socket
-                    .set_reuseaddr(true)
-                    .or_err(SocketError, "failed to set socket opts SO_REUSEADDR")?;
+                // SO_REUSEADDR before bind() lets the upstream socket bind a client's
+                // *exact* source ip:port while an earlier connection on it lingers in
+                // TIME_WAIT; it never lets two live sockets share a 4-tuple. That is its
+                // one use, so a port-0 bind never takes it.
+                //
+                // Where bind() picks the port itself (every platform but Linux, whose
+                // IP_BIND_ADDRESS_NO_PORT defers the pick to connect(), where the flag
+                // plays no part), SO_REUSEADDR narrows the pick's check to UNCONNECTED
+                // sockets (FreeBSD's `in_pcbbind_setup`): a port already carrying a
+                // connection to the same destination — live or in TIME_WAIT — is handed
+                // out again, and connect() fails EADDRINUSE on the identical 4-tuple.
+                // Without it the pick skips every socket on that address and port, so a
+                // source-bound connect never collides; the bound is then one port per
+                // connection per source address, reported at bind() as EADDRNOTAVAIL.
+                if baddr.port() != 0 {
+                    socket
+                        .set_reuseaddr(true)
+                        .or_err(SocketError, "failed to set socket opts SO_REUSEADDR")?;
+                }
                 socket
                     .bind(baddr)
                     .or_err_with(BindError, || format!("failed to bind to socket {}", baddr))?;
@@ -807,10 +815,12 @@ async fn inner_connect_with<F: FnOnce(&TcpSocket) -> Result<()>>(
     #[cfg(windows)]
     if let Some(bind_to) = bind_to {
         if let Some(baddr) = bind_to.addr {
-            // See the unix branch: allow rebinding a TIME_WAIT-held source address.
-            socket
-                .set_reuseaddr(true)
-                .or_err(SocketError, "failed to set socket opts SO_REUSEADDR")?;
+            // See the unix branch: only an exact port rebinds a TIME_WAIT-held address.
+            if baddr.port() != 0 {
+                socket
+                    .set_reuseaddr(true)
+                    .or_err(SocketError, "failed to set socket opts SO_REUSEADDR")?;
+            }
             socket
                 .bind(baddr)
                 .or_err_with(BindError, || format!("failed to bind to socket {}", baddr))?;
@@ -1064,6 +1074,59 @@ mod test {
         let sock = TcpSocket::new_v4().unwrap();
         set_bind_nonlocal(sock.as_raw_fd(), false).unwrap();
         sock.bind(foreign).unwrap();
+    }
+
+    /// Many source-bound connections to ONE destination all connect. Where bind() picks
+    /// the port (every platform but Linux), a pick that ignored connected sockets hands a
+    /// port out twice and connect() fails EADDRINUSE on the identical 4-tuple: with 1000
+    /// connections over FreeBSD's ~55k-port range, ~9 collisions are expected (none in
+    /// ~1e-4 of runs).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_source_bound_connects_to_one_destination_never_collide() {
+        const WANTED: usize = 1000;
+        // The client ends are held open — a closed one frees its tuple — so the process
+        // needs room for them beside every other test's descriptors: a 1024 soft limit
+        // would fail this on EMFILE instead of on a collision.
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit/setrlimit write and read only the struct passed.
+        unsafe {
+            assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit), 0);
+            let want = (4 * WANTED) as libc::rlim_t;
+            if limit.rlim_cur < want {
+                limit.rlim_cur = want.min(limit.rlim_max);
+                assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &limit), 0);
+            }
+        }
+        // Under a hard limit too low to raise past, fewer connections: a weaker net (512
+        // expects ~2.4 collisions) rather than a failure on EMFILE.
+        let connections = WANTED.min(limit.rlim_cur as usize / 2);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote_addr = listener.local_addr().unwrap();
+        // The accepted ends are dropped at once: the tuple lives on in the client's socket.
+        let accepted = tokio::spawn(async move { while listener.accept().await.is_ok() {} });
+
+        let mut bind_to = BindTo::default();
+        bind_to.addr = Some("127.0.0.1:0".parse().unwrap());
+        let mut connected = Vec::with_capacity(connections);
+        let mut collisions = 0;
+        for _ in 0..connections {
+            match connect(&remote_addr, Some(&bind_to)).await {
+                Ok(stream) => connected.push(stream),
+                Err(e) if format!("{e}").contains("in use") => collisions += 1,
+                Err(e) => panic!("an unexpected connect failure: {e}"),
+            }
+        }
+        assert_eq!(
+            collisions, 0,
+            "a source-bound connect must never be handed a port whose 4-tuple is taken"
+        );
+        drop(connected);
+        accepted.abort();
     }
 
     #[tokio::test]
