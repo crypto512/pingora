@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use log::debug;
+use log::{debug, warn};
 use pingora_error::{Error, ErrorType::*, OrErr, Result};
 use std::net::IpAddr;
 use std::sync::{Arc, Once};
@@ -108,7 +108,15 @@ impl Connector {
             .set_min_proto_version(Some(SslVersion::TLS1))
             .unwrap();
         if let Some(conf) = options.as_ref() {
-            if let Some(ca_file_path) = conf.ca_file.as_ref() {
+            if let Some(verify_hook) = conf.tls_verify_hook.as_ref() {
+                if conf.ca_file.is_some() {
+                    warn!("ConnectorOptions::ca_file is ignored: tls_verify_hook decides the verification store");
+                }
+                // `SslConnector::builder` loaded the default verify paths: the hook starts
+                // from an empty store, so the store is the hook's alone.
+                builder.set_cert_store(X509StoreBuilder::new().unwrap().build());
+                verify_hook(&mut builder);
+            } else if let Some(ca_file_path) = conf.ca_file.as_ref() {
                 builder.set_ca_file(ca_file_path).unwrap();
             } else {
                 init_ssl_cert_env_vars();
