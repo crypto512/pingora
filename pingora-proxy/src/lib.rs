@@ -223,9 +223,31 @@ impl<SV> HttpProxy<SV, (), ()> {
     /// // Use proxy.process_new_http() in your custom accept loop
     /// ```
     pub fn new(inner: SV, conf: Arc<ServerConf>) -> Self {
+        let client_options = ConnectorOptions::from_server_conf(&conf);
+        Self::new_with_client_options(inner, conf, client_options)
+    }
+
+    /// Create a new [`HttpProxy`] like [`HttpProxy::new`], with its upstream connector built
+    /// from `client_options` instead of [`ConnectorOptions::from_server_conf`] — what
+    /// [`ProxyServiceBuilder::client_options`] does for the [`Service`] path, for a custom
+    /// accept loop.
+    ///
+    /// Start the options from the server configuration, or its upstream settings (the
+    /// keep-alive pool size, the source binds, the connect offload) are lost:
+    ///
+    /// ```ignore
+    /// let mut client_options = ConnectorOptions::from_server_conf(&server_conf);
+    /// client_options.keepalive_pool_callback = Some(my_callback);
+    /// let mut proxy = HttpProxy::new_with_client_options(my_proxy_app, server_conf, client_options);
+    /// ```
+    pub fn new_with_client_options(
+        inner: SV,
+        conf: Arc<ServerConf>,
+        client_options: ConnectorOptions,
+    ) -> Self {
         HttpProxy {
             inner,
-            client_upstream: Connector::new(Some(ConnectorOptions::from_server_conf(&conf))),
+            client_upstream: Connector::new(Some(client_options)),
             shutdown: ShardedNotify::new(conf.threads),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             server_options: None,
@@ -2869,6 +2891,20 @@ mod tests {
     fn pending_session() -> Box<HttpSession> {
         let stream = L4Stream::from(VirtualSocketStream::new(Box::new(PendingVirtualSocket)));
         Box::new(HttpSession::new_http1(Box::new(stream)))
+    }
+
+    #[test]
+    #[cfg(any(feature = "openssl", feature = "boringssl"))]
+    fn new_with_client_options_builds_the_connector_from_the_given_options() {
+        let conf = Arc::new(ServerConf::default());
+        let hook_ran = Arc::new(AtomicBool::new(false));
+        let mut options = ConnectorOptions::from_server_conf(&conf);
+        let seen = hook_ran.clone();
+        options.tls_verify_hook = Some(Arc::new(move |_builder| {
+            seen.store(true, Ordering::SeqCst);
+        }));
+        let _proxy = HttpProxy::new_with_client_options(NoopProxy, conf, options);
+        assert!(hook_ran.load(Ordering::SeqCst));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

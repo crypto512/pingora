@@ -65,13 +65,19 @@ impl IdleConnection {
 /// without being reused.
 pub type PoolCallback = Arc<dyn Fn(Duration) + Send + Sync>;
 
+/// Configures how the upstream TLS connector verifies servers, in place of
+/// [`ConnectorOptions::ca_file`] and the default verify paths. See
+/// [`ConnectorOptions::tls_verify_hook`].
+#[cfg(feature = "openssl_derived")]
+pub type TlsVerifyHook = Arc<dyn Fn(&mut crate::tls::ssl::SslConnectorBuilder) + Send + Sync>;
+
 /// The options to configure a [TransportConnector]
 #[derive(Clone)]
 pub struct ConnectorOptions {
     /// Path to the CA file used to validate server certs.
     ///
     /// If `None`, the CA in the [default](https://www.openssl.org/docs/manmaster/man3/SSL_CTX_set_default_verify_paths.html)
-    /// locations will be loaded
+    /// locations will be loaded. Not read when `tls_verify_hook` is set.
     pub ca_file: Option<String>,
     /// The maximum number of unique s2n configs to cache. Creating a new s2n config is an
     /// expensive operation, so we cache and re-use config objects with identical configurations.
@@ -110,6 +116,29 @@ pub struct ConnectorOptions {
     /// Optional callback for observing how long upstream connections stayed idle
     /// before leaving the keep-alive pool without reuse.
     pub keepalive_pool_callback: Option<PoolCallback>,
+    /// When set, decides how the TLS connectors built from these options verify servers,
+    /// in place of [`Self::ca_file`] and the default verify paths, neither of which is
+    /// then read and nothing of which is written to the process environment. It is called
+    /// with each connector's builder (an HTTP connector builds one for HTTP/1 and one for
+    /// HTTP/2) holding an EMPTY verification store: the store is the hook's alone, and a
+    /// hook that installs nothing trusts nothing. It may install a verify callback, and
+    /// should configure nothing but verification.
+    ///
+    /// It runs after the connector's cipher, signature-algorithm and protocol-version
+    /// settings and before [`Self::cert_key_file`] and the key log. What `connect` sets
+    /// per connection is unchanged: the verify mode (`NONE` for an empty SNI or a peer
+    /// that does not verify), the hostname check, and a peer's own CA list
+    /// (`PeerOptions::ca`), which replaces the store for that connection.
+    ///
+    /// A verify callback the hook installs is kept by every connection. It runs
+    /// synchronously inside the handshake, once per certificate and failed check —
+    /// on a connection that does not verify too (whose verdict is then discarded), and
+    /// against a peer's own CA list. It sees every verdict, the hostname and
+    /// validity-period ones included, and its return value decides each.
+    ///
+    /// The hook cannot fail: load and check the store before handing it over.
+    #[cfg(feature = "openssl_derived")]
+    pub tls_verify_hook: Option<TlsVerifyHook>,
 }
 
 impl ConnectorOptions {
@@ -147,6 +176,8 @@ impl ConnectorOptions {
             bind_to_v4,
             bind_to_v6,
             keepalive_pool_callback: None,
+            #[cfg(feature = "openssl_derived")]
+            tls_verify_hook: None,
         }
     }
 
@@ -163,6 +194,8 @@ impl ConnectorOptions {
             bind_to_v4: vec![],
             bind_to_v6: vec![],
             keepalive_pool_callback: None,
+            #[cfg(feature = "openssl_derived")]
+            tls_verify_hook: None,
         }
     }
 }
@@ -820,6 +853,129 @@ mod tests {
             .connect_local_addr()
             .expect("TLS handshake failure should retain the assigned local address");
         assert_ne!(local_addr.port(), 0);
+    }
+
+    /// A loopback TLS listener presenting the self-signed test certificate
+    /// (`tests/keys/server.crt`, `openrusty.org`) on every connection it accepts.
+    #[cfg(feature = "openssl_derived")]
+    async fn self_signed_tls_listener() -> SocketAddr {
+        use crate::tls::ssl::{SslAcceptor, SslFiletype, SslMethod};
+
+        let cert = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
+        let key = format!("{}/tests/keys/key.pem", env!("CARGO_MANIFEST_DIR"));
+        let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
+        builder.set_certificate_chain_file(cert).unwrap();
+        builder.set_private_key_file(key, SslFiletype::PEM).unwrap();
+        let acceptor = Arc::new(builder.build());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let tcp = crate::protocols::l4::stream::Stream::from(tcp);
+                    if let Ok(mut tls) =
+                        crate::protocols::tls::server::handshake(&acceptor, tcp).await
+                    {
+                        // Hold the session until the client is done with it.
+                        let mut buf = [0; 1];
+                        let _ = tls.read(&mut buf).await;
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "openssl_derived")]
+    async fn test_tls_verify_hook_decides_the_verification_store() {
+        let addr = self_signed_tls_listener().await;
+        let mut peer = BasicPeer::new(&addr.to_string());
+        peer.sni = "openrusty.org".to_string();
+        peer.options.connection_timeout = Some(Duration::from_secs(5));
+        assert!(peer.verify_cert() && peer.verify_hostname());
+
+        // The hook's store trusts the self-signed certificate. A `ca_file` that cannot be
+        // read sits beside it: building the connector panics if `ca_file` is read at all.
+        let mut options = ConnectorOptions::new(1);
+        options.ca_file = Some("/nonexistent/pingora-test-ca.pem".to_string());
+        options.tls_verify_hook = Some(Arc::new(|builder| {
+            let cert = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
+            builder.set_ca_file(cert).unwrap();
+        }));
+        let tls_connector = Connector::new(Some(options));
+        let stream = do_connect(&peer, None, None, &tls_connector.ctx, None).await;
+        assert!(
+            stream.is_ok(),
+            "the hook's store verifies the server: {:?}",
+            stream.err()
+        );
+
+        // Control: without the hook the same connection verifies against the default
+        // store, which does not hold the self-signed certificate.
+        let tls_connector = Connector::new(Some(ConnectorOptions::new(1)));
+        let err = do_connect(&peer, None, None, &tls_connector.ctx, None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.etype(), &InvalidCert, "{err}");
+
+        // Control: the hook does not loosen the per-connection hostname check.
+        let mut options = ConnectorOptions::new(1);
+        options.tls_verify_hook = Some(Arc::new(|builder| {
+            let cert = format!("{}/tests/keys/server.crt", env!("CARGO_MANIFEST_DIR"));
+            builder.set_ca_file(cert).unwrap();
+        }));
+        let tls_connector = Connector::new(Some(options));
+        peer.sni = "not-openrusty.org".to_string();
+        let err = do_connect(&peer, None, None, &tls_connector.ctx, None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.etype(), &InvalidCert, "{err}");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "openssl_derived")]
+    async fn test_tls_verify_hook_callback_survives_the_per_connection_verify_mode() {
+        use crate::tls::ssl::SslVerifyMode;
+        use std::sync::atomic::AtomicUsize;
+
+        let addr = self_signed_tls_listener().await;
+        let mut peer = BasicPeer::new(&addr.to_string());
+        peer.sni = "openrusty.org".to_string();
+        peer.options.connection_timeout = Some(Duration::from_secs(5));
+
+        // A store without the self-signed certificate, and a callback that accepts every
+        // verdict: the connection succeeds only if the callback installed on the context
+        // is the one consulted after `connect` sets the verify mode on the connection.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let mut options = ConnectorOptions::new(1);
+        options.tls_verify_hook = Some(Arc::new(move |builder| {
+            let seen = seen.clone();
+            builder.set_verify_callback(SslVerifyMode::PEER, move |_preverify_ok, _ctx| {
+                seen.fetch_add(1, Ordering::SeqCst);
+                true
+            });
+        }));
+        let tls_connector = Connector::new(Some(options));
+        let stream = do_connect(&peer, None, None, &tls_connector.ctx, None).await;
+        assert!(
+            stream.is_ok(),
+            "the context's verify callback decided the verdict: {:?}",
+            stream.err()
+        );
+        assert!(calls.load(Ordering::SeqCst) > 0);
+
+        // Control: the same store without the callback refuses the server.
+        let mut options = ConnectorOptions::new(1);
+        options.tls_verify_hook = Some(Arc::new(|_builder| {}));
+        let tls_connector = Connector::new(Some(options));
+        let err = do_connect(&peer, None, None, &tls_connector.ctx, None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.etype(), &InvalidCert, "{err}");
     }
 
     #[tokio::test]
