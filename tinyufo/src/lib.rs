@@ -139,6 +139,12 @@ struct FiFoQueues<T> {
     main: SegQueue<Key>,
     main_weight: AtomicUsize,
 
+    // Beside the weights, which every insert already writes: counted where they happen.
+    // Stored items pushed out to make room.
+    evicted: AtomicUsize,
+    // New items TinyLFU did not admit over the item they would have pushed out.
+    rejected: AtomicUsize,
+
     // this replaces the ghost queue of S3-FIFO with similar goal: track the evicted assets
     estimator: TinyLfu,
 
@@ -199,11 +205,14 @@ impl<T: Clone + Send + Sync + 'static> FiFoQueues<T> {
                         let first = evicted.pop().expect("just check non-empty");
                         // return the put value
                         evicted.push(KV { key, data, weight });
+                        self.rejected.fetch_add(1, Relaxed);
                         (first.key, first.data, first.weight)
                     } else {
+                        self.count_evicted(evicted.len());
                         (key, data, weight)
                     }
                 } else {
+                    self.count_evicted(evicted.len());
                     (key, data, weight)
                 };
 
@@ -238,7 +247,16 @@ impl<T: Clone + Send + Sync + 'static> FiFoQueues<T> {
         // NOTE: there is a chance that the item itself is evicted if it happens to be the one selected
         // by the algorithm. We could avoid this by checking if the item is in the returned evicted items,
         // and then add it back. But to keep the code simple we just allow it to happen.
-        self.evict_to_limit(0, buckets)
+        let evicted = self.evict_to_limit(0, buckets);
+        self.count_evicted(evicted.len());
+        evicted
+    }
+
+    fn count_evicted(&self, n: usize) {
+        // Below the limit nothing is evicted: no write at all.
+        if n > 0 {
+            self.evicted.fetch_add(n, Relaxed);
+        }
     }
 
     // the `extra_weight` is to essentially tell the cache to reserve that amount of weight for
@@ -369,6 +387,8 @@ impl<K: Hash, T: Clone + Send + Sync + 'static> TinyUfo<K, T> {
             small_weight: 0.into(),
             main: SegQueue::new(),
             main_weight: 0.into(),
+            evicted: 0.into(),
+            rejected: 0.into(),
             total_weight_limit,
             estimator: TinyLfu::new(estimated_size),
             _t: PhantomData,
@@ -391,6 +411,8 @@ impl<K: Hash, T: Clone + Send + Sync + 'static> TinyUfo<K, T> {
             small_weight: 0.into(),
             main: SegQueue::new(),
             main_weight: 0.into(),
+            evicted: 0.into(),
+            rejected: 0.into(),
             total_weight_limit,
             estimator: TinyLfu::new_compact(estimated_size),
             _t: PhantomData,
@@ -422,6 +444,20 @@ impl<K: Hash, T: Clone + Send + Sync + 'static> TinyUfo<K, T> {
     pub fn put(&self, key: K, data: T, weight: Weight) -> Vec<KV<T>> {
         let key = self.random_status.hash_one(&key);
         self.queues.admit(key, data, weight, false, &self.buckets)
+    }
+
+    /// How many stored items have been pushed out to make room since the cache was created —
+    /// the items [TinyUfo::put] and [TinyUfo::force_put] returned other than ones they did not
+    /// admit. A [TinyUfo::remove] is not counted.
+    pub fn evicted(&self) -> usize {
+        self.queues.evicted.load(Relaxed)
+    }
+
+    /// How many items [TinyUfo::put] offered that TinyLFU did not admit over the item they
+    /// would have pushed out, since the cache was created. [TinyUfo::force_put] admits every
+    /// item, so it never adds to this.
+    pub fn rejected(&self) -> usize {
+        self.queues.rejected.load(Relaxed)
     }
 
     /// Remove the given key from the cache if it exists
@@ -618,11 +654,35 @@ mod tests {
         let evicted = cache.put(4, 4, 1);
         assert_eq!(evicted.len(), 1);
         assert_eq!(evicted[0].data, 4); // 4 is returned
+        assert_eq!(cache.rejected(), 1, "4 was offered and not admitted");
+        assert_eq!(cache.evicted(), 0, "no stored item left");
 
         assert_eq!(cache.peek_queue(1), Some(SMALL));
         assert_eq!(cache.peek_queue(2), Some(SMALL));
         assert_eq!(cache.peek_queue(3), Some(SMALL));
         assert_eq!(cache.peek_queue(4), None);
+    }
+
+    #[test]
+    fn test_evictions_and_rejections_are_counted() {
+        let mut cache = TinyUfo::new(2, 2);
+        cache.random_status = RandomState::with_seeds(2, 3, 4, 5);
+        cache.queues.estimator = TinyLfu::new_seeded(2);
+
+        cache.force_put(1, 1, 1);
+        cache.force_put(2, 2, 1);
+        cache.force_put(2, 2, 1);
+        assert_eq!(
+            (cache.evicted(), cache.rejected()),
+            (0, 0),
+            "within its limit"
+        );
+        let out = cache.force_put(3, 3, 1);
+        assert_eq!(out.len(), 1);
+        assert_eq!(cache.evicted(), 1, "the item force_put pushed out");
+        assert_eq!(cache.rejected(), 0, "force_put admits every item");
+        cache.remove(&3);
+        assert_eq!(cache.evicted(), 1, "a removal is not an eviction");
     }
 
     #[test]

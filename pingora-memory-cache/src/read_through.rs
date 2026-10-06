@@ -137,6 +137,13 @@ where
             phantom: PhantomData,
         }
     }
+
+    /// How many looked-up values have been pushed out to make room, expired ones included:
+    /// see [MemoryCache::evicted]. A lookup's value is always admitted, so none is ever
+    /// rejected.
+    pub fn evicted(&self) -> usize {
+        self.inner.evicted()
+    }
 }
 
 impl<K, T, CB, S> RTCache<K, T, CB, S>
@@ -461,6 +468,31 @@ mod tests {
             }
             Ok(resp)
         }
+    }
+
+    #[tokio::test]
+    async fn test_evictions_are_counted() {
+        let cache: RTCache<i32, i32, TestCB, ExtraOpt> = RTCache::new(2, None, None);
+        for key in 0..2 {
+            cache
+                .get(&key, None, None)
+                .await
+                .0
+                .expect("the lookup answers");
+        }
+        assert_eq!(cache.evicted(), 0, "within its size, nothing leaves");
+        for key in 2..5 {
+            cache
+                .get(&key, None, None)
+                .await
+                .0
+                .expect("the lookup answers");
+        }
+        assert_eq!(
+            cache.evicted(),
+            3,
+            "every lookup past its size pushes one out"
+        );
     }
 
     #[tokio::test]
