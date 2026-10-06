@@ -118,6 +118,19 @@ impl<K: Hash, T: Clone + Send + Sync + 'static> MemoryCache<K, T> {
         }
     }
 
+    /// How many stored items have been pushed out to make room since the cache was
+    /// created: see [TinyUfo::evicted]. An item whose TTL has passed stays stored until
+    /// it is pushed out — nothing else removes it — and is counted then.
+    pub fn evicted(&self) -> usize {
+        self.store.evicted()
+    }
+
+    /// How many items [MemoryCache::put] offered that the cache did not admit: see
+    /// [TinyUfo::rejected]. A zero-TTL put is not offered, so it is not counted.
+    pub fn rejected(&self) -> usize {
+        self.store.rejected()
+    }
+
     /// Fetch the key and return its value in addition to a [CacheStatus].
     pub fn get<Q>(&self, key: &Q) -> (Option<T>, CacheStatus)
     where
@@ -332,6 +345,24 @@ mod tests {
         let (res, hit) = cache.get(&3);
         assert_eq!(res.unwrap(), 6);
         assert_eq!(hit, CacheStatus::Hit);
+    }
+
+    #[test]
+    fn test_evictions_are_counted() {
+        // `force_put`, so TinyLFU's sketch cannot decide the case under test.
+        let cache: MemoryCache<i32, i32> = MemoryCache::new(2);
+        cache.force_put(&1, 2, Some(Duration::from_millis(1)));
+        cache.force_put(&2, 4, Some(Duration::from_millis(1)));
+        assert_eq!(cache.evicted(), 0, "within its size, nothing leaves");
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(cache.get(&1).1, CacheStatus::Expired);
+        cache.force_put(&3, 6, None);
+        assert_eq!(
+            cache.evicted(),
+            1,
+            "an expired item stays stored until pushed out, and is counted then"
+        );
+        assert_eq!(cache.rejected(), 0);
     }
 
     #[test]
