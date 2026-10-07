@@ -20,6 +20,7 @@ use std::fs::{self, OpenOptions};
 use std::os::unix::prelude::OpenOptionsExt;
 use std::path::Path;
 use std::process;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -76,6 +77,52 @@ const NOTIFY_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
 /// How long to sleep between pid-file liveness checks in the async wait loop.
 const LIVENESS_CHECK_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Set by [`on_ready_signal`]: the daemon's readiness `SIGUSR1` arrived, however early.
+static READY_SIGNALED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_ready_signal(_: libc::c_int) {
+    READY_SIGNALED.store(true, Ordering::SeqCst);
+}
+
+/// Catch the readiness `SIGUSR1` from here on, returning the disposition it replaced.
+///
+/// Called just before the fork: the daemon signals as its bootstrap starts, which can be
+/// before the parent reaches its wait loop, and under the default disposition that signal
+/// terminates the parent, which then reports a failed start for a daemon that is serving.
+/// A disposition is process-wide, so it holds whichever of the parent's threads the kernel
+/// delivers to. `SA_RESTART`, so the parent's own `waitpid` on the fork's intermediate
+/// child is not cut short by it either.
+fn catch_ready_signal() -> libc::sigaction {
+    // SAFETY: zeroed `sigaction`s are valid inputs; the handler only stores an atomic,
+    // which is async-signal-safe.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = on_ready_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        libc::sigemptyset(&mut action.sa_mask);
+        action.sa_flags = libc::SA_RESTART;
+        let mut previous: libc::sigaction = std::mem::zeroed();
+        if libc::sigaction(libc::SIGUSR1, &action, &mut previous) != 0 {
+            panic!(
+                "Daemonize failed: cannot catch SIGUSR1: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        previous
+    }
+}
+
+/// Put back the `SIGUSR1` disposition [`catch_ready_signal`] replaced — in the daemon,
+/// which inherits the parent's handler across the fork and is not the one waiting.
+fn restore_ready_signal(previous: &libc::sigaction) {
+    // SAFETY: `previous` is the disposition `sigaction(2)` itself returned.
+    if unsafe { libc::sigaction(libc::SIGUSR1, previous, std::ptr::null_mut()) } != 0 {
+        error!(
+            "failed to restore the SIGUSR1 disposition in the daemon: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+}
 
 // XXX: this operation should have been done when the old service is exiting.
 // Now the new pid file just kick the old one out of the way
@@ -189,8 +236,9 @@ pub struct DaemonizeResult {
 /// When [`ServerConf::daemon_wait_for_ready`] is `false` (the default), the parent exits
 /// immediately — matching the behavior of `start()`.
 ///
-/// When `daemon_wait_for_ready` is `true`, the parent registers a `SIGUSR1` handler before
-/// forking, then waits (in a sleep loop polling the pid file and the signal flag) for up to
+/// When `daemon_wait_for_ready` is `true`, the parent installs a `SIGUSR1` handler before
+/// forking ([`catch_ready_signal`]), then waits on a `SIGUSR1` listener and the flag that
+/// handler sets, checking the pid file every 100 ms, for up to
 /// [`ServerConf::daemon_ready_timeout_seconds`] (default 600 s) for the grandchild to send
 /// `SIGUSR1`. On success the parent exits with code 0. On timeout, or if the daemon process
 /// exits before signaling, the parent exits with code 1, causing systemd to abort the reload.
@@ -208,11 +256,17 @@ pub fn daemonize(conf: &ServerConf) -> DaemonizeResult {
 
     move_old_pid(&conf.pid_file);
 
-    match build_daemonize(conf).execute() {
+    let daemonize = build_daemonize(conf);
+    let previous_disposition = conf.daemon_wait_for_ready.then(catch_ready_signal);
+
+    match daemonize.execute() {
         Outcome::Parent(result) => {
             result.unwrap_or_else(|e| panic!("Daemonize failed: {e}"));
         }
         Outcome::Child(result) => {
+            if let Some(previous) = &previous_disposition {
+                restore_ready_signal(previous);
+            }
             result.unwrap_or_else(|e| panic!("Daemonize child setup failed: {e}"));
             return DaemonizeResult {
                 notify_parent_pid: parent_pid,
@@ -260,9 +314,10 @@ fn build_parent_runtime() -> tokio::runtime::Runtime {
 
 /// Wait for the daemon grandchild to send `SIGUSR1`, up to `timeout`.
 ///
-/// Uses a local tokio runtime with [`tokio::signal::unix`] to listen for `SIGUSR1` instead of
-/// raw signal handlers and polling loops. The daemon's PID is checked periodically via the pid
-/// file — if the process exits before signaling, the parent aborts.
+/// Uses a local tokio runtime with [`tokio::signal::unix`] to listen for `SIGUSR1`, and the
+/// flag [`catch_ready_signal`] set for one that arrived before the listener existed. The
+/// daemon's PID is checked periodically via the pid file — if the process exits before
+/// signaling, the parent aborts.
 ///
 /// Exits the process directly:
 /// - exit code 0 if `SIGUSR1` is received (daemon is ready).
@@ -284,6 +339,14 @@ fn wait_for_ready_or_exit(pid_file: &str, timeout: Duration) {
 
         let result = tokio_timeout(timeout, async {
             loop {
+                // The handler installed before the fork records every readiness signal —
+                // signal-hook, under the listener above, still calls it — so a signal that
+                // arrived before the listener existed is here; the listener only wakes the
+                // loop sooner than the next liveness tick.
+                if READY_SIGNALED.load(Ordering::SeqCst) {
+                    info!("Daemon signaled readiness, parent exiting");
+                    return;
+                }
                 tokio::select! {
                     _ = sigusr1.recv() => {
                         info!("Daemon signaled readiness, parent exiting");
@@ -442,5 +505,64 @@ fn build_daemonize(conf: &ServerConf) -> Daemonize<()> {
     match conf.group.as_ref() {
         Some(group) => daemonize.group(group.as_str()),
         None => daemonize,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A daemon that signals readiness before the parent reaches its wait loop must not
+    /// kill the parent, and the wait must see that it is ready.
+    ///
+    /// Played out in a forked process, so the signal, the handler and the exit the wait
+    /// takes on failure touch no other test: that process catches the signal, holds a
+    /// second thread (as a parent whose runtime threads outlived the fork does) so the
+    /// process-directed signal may land on either, signals itself, and waits. Without the
+    /// handler it dies of `SIGUSR1`; without the flag check it times out and exits 1.
+    #[test]
+    fn a_readiness_signal_sent_before_the_wait_begins_is_seen_not_fatal() {
+        // SAFETY: the child calls nothing that needs a lock another thread of this test
+        // binary could hold at the fork, beyond the allocator, which is fork-safe.
+        let child = unsafe { libc::fork() };
+        assert!(
+            child >= 0,
+            "fork failed: {}",
+            std::io::Error::last_os_error()
+        );
+        if child == 0 {
+            catch_ready_signal();
+            thread::spawn(|| thread::sleep(Duration::from_secs(30)));
+            let code = match send_signal(process::id() as libc::pid_t, libc::SIGUSR1) {
+                Ok(()) => {
+                    let started = Instant::now();
+                    wait_for_ready_or_exit(
+                        "/nonexistent/pingora-daemon-test.pid",
+                        Duration::from_secs(5),
+                    );
+                    if started.elapsed() < Duration::from_secs(1) {
+                        0
+                    } else {
+                        2
+                    }
+                }
+                Err(_) => 3,
+            };
+            // SAFETY: leave the forked copy of the test harness without unwinding it.
+            unsafe { libc::_exit(code) };
+        }
+        let mut status = 0;
+        // SAFETY: `child` is this process's own child.
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(
+            !libc::WIFSIGNALED(status),
+            "the early readiness signal killed the waiting process (signal {})",
+            libc::WTERMSIG(status)
+        );
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            0,
+            "1: the wait never saw the signal; 2: it saw it late; 3: it could not be sent"
+        );
     }
 }
