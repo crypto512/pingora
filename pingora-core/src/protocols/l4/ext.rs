@@ -221,32 +221,26 @@ fn ip_bind_addr_no_port(_fd: RawFd, _val: bool) -> io::Result<()> {
 /// IP_LOCAL_PORT_RANGE is only supported on Linux 6.3 and higher,
 /// ip_local_port_range() is a no-op on unsupported versions.
 /// See the [man page](https://man7.org/linux/man-pages/man7/ip.7.html) for more details.
-/// Returns whether the kernel actually applied a *restricting* range. `(0, 0)` clears the
-/// range rather than narrowing it, and an old kernel answers `ENOPROTOOPT`; both leave the
-/// socket free to use the whole ephemeral range, so both report `false`. Callers classify on
-/// what was applied, never on what was asked for.
 #[cfg(target_os = "linux")]
-fn ip_local_port_range(fd: RawFd, low: u16, high: u16) -> io::Result<bool> {
+fn ip_local_port_range(fd: RawFd, low: u16, high: u16) -> io::Result<()> {
     const IP_LOCAL_PORT_RANGE: i32 = 51;
     let range: u32 = (low as u32) | ((high as u32) << 16);
 
     let result = set_opt(fd, libc::IPPROTO_IP, IP_LOCAL_PORT_RANGE, range as c_int);
     match result {
         Err(e) if e.raw_os_error() != Some(libc::ENOPROTOOPT) => Err(e),
-        // The kernel predates IP_LOCAL_PORT_RANGE: nothing was applied.
-        Err(_) => Ok(false),
-        Ok(()) => Ok(low != 0 || high != 0),
+        _ => Ok(()), // no error or ENOPROTOOPT
     }
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-fn ip_local_port_range(_fd: RawFd, _low: u16, _high: u16) -> io::Result<bool> {
-    Ok(false)
+fn ip_local_port_range(_fd: RawFd, _low: u16, _high: u16) -> io::Result<()> {
+    Ok(())
 }
 
 #[cfg(windows)]
-fn ip_local_port_range(_fd: RawSocket, _low: u16, _high: u16) -> io::Result<bool> {
-    Ok(false)
+fn ip_local_port_range(_fd: RawSocket, _low: u16, _high: u16) -> io::Result<()> {
+    Ok(())
 }
 
 /// Allow the socket to bind to and send from a non-local source address, e.g.
@@ -739,10 +733,6 @@ async fn inner_connect_with<F: FnOnce(&TcpSocket) -> Result<()>>(
     attempt: &mut ConnectAttempt,
 ) -> Result<TcpStream> {
     attempt.clear();
-    // What this connect actually pinned about its local endpoint. Recorded as the socket is
-    // set up, never inferred afterwards from the BindTo — whose port range may be a reset
-    // sentinel, or unsupported by the running kernel.
-    let mut local_binding = LocalBinding::Unbound;
     let socket = if addr.is_ipv4() {
         TcpSocket::new_v4()
     } else {
@@ -775,11 +765,8 @@ async fn inner_connect_with<F: FnOnce(&TcpSocket) -> Result<()>>(
             }
 
             if let Some((low, high)) = bind_to.port_range() {
-                let applied = ip_local_port_range(socket.as_raw_fd(), low, high)
+                ip_local_port_range(socket.as_raw_fd(), low, high)
                     .or_err(SocketError, "failed to set socket opts IP_LOCAL_PORT_RANGE")?;
-                if applied {
-                    local_binding = LocalBinding::PortRange;
-                }
             }
 
             if let Some(baddr) = bind_to.addr {
@@ -805,9 +792,6 @@ async fn inner_connect_with<F: FnOnce(&TcpSocket) -> Result<()>>(
                 socket
                     .bind(baddr)
                     .or_err_with(BindError, || format!("failed to bind to socket {}", baddr))?;
-                if matches!(local_binding, LocalBinding::Unbound) {
-                    local_binding = LocalBinding::Source;
-                }
             }
         }
     }
@@ -830,6 +814,10 @@ async fn inner_connect_with<F: FnOnce(&TcpSocket) -> Result<()>>(
 
     set_socket(&socket)?;
 
+    // Read off the socket once every step that may bind it has run: the BindTo above and
+    // `set_socket`, which may bind the socket itself.
+    let source_checked_at_connect = source_checked_at_connect(&socket);
+
     let socket = into_socket2(socket);
     if let Err(error) = socket.connect(&(*addr).into()) {
         attempt.record_local_addr(&socket);
@@ -838,7 +826,7 @@ async fn inner_connect_with<F: FnOnce(&TcpSocket) -> Result<()>>(
                 error,
                 format!("Fail to connect to {}", *addr),
                 attempt.local_addr(),
-                local_binding,
+                source_checked_at_connect,
             ));
         }
     } else {
@@ -860,7 +848,7 @@ async fn inner_connect_with<F: FnOnce(&TcpSocket) -> Result<()>>(
             error,
             format!("Fail to connect to {}", *addr),
             attempt.local_addr(),
-            local_binding,
+            source_checked_at_connect,
         ));
     }
 
@@ -883,60 +871,56 @@ pub async fn connect_uds(path: &std::path::Path) -> Result<UnixStream> {
             e,
             format!("Fail to connect to {}", path.display()),
             None,
-            LocalBinding::Unbound,
+            false,
         )
     })
 }
 
-/// What a `connect()` pinned about its own local endpoint. `EADDRNOTAVAIL` from `connect()`
-/// carries a different meaning in each case, and the errno alone cannot tell them apart.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LocalBinding {
-    /// Neither a source address nor an applied port range: the kernel chose the whole local
-    /// endpoint. `EADDRNOTAVAIL` then reports that it ran out of ephemeral ports.
-    Unbound,
-    /// A source address was bound, with the port left to the kernel. `EADDRNOTAVAIL` reports
-    /// that the destination is not reachable from that source.
-    Source,
-    /// The kernel accepted a restricting `IP_LOCAL_PORT_RANGE`. `EADDRNOTAVAIL` reports that
-    /// the range is exhausted.
-    PortRange,
+/// Whether this socket pinned a source (an address, a port, or both) that the kernel will
+/// validate only at `connect()` — which is what an `EADDRNOTAVAIL` from `connect()` then
+/// reports: the destination is not reachable from that source.
+///
+/// FreeBSD and macOS check a bound source at `connect()` and pick its port at `bind()`, so
+/// there a connect-time `EADDRNOTAVAIL` on a bound socket is a route failure. Linux refuses an
+/// unusable source at `bind()` and an unroutable destination as `ENETUNREACH`, so every
+/// `EADDRNOTAVAIL` its `connect()` returns is local: the ports a source has towards that
+/// destination ran out (`IP_BIND_ADDRESS_NO_PORT` defers the pick to `connect()`), an exact
+/// port's 4-tuple is still held, or a port range is exhausted — never asked of the socket
+/// there. A socket whose address cannot be read is treated as unbound, so its `EADDRNOTAVAIL`
+/// stays a local limit rather than becoming a route failure.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn source_checked_at_connect(socket: &TcpSocket) -> bool {
+    socket
+        .local_addr()
+        .is_ok_and(|local| !local.ip().is_unspecified() || local.port() != 0)
+}
+
+#[cfg(any(target_os = "linux", windows))]
+fn source_checked_at_connect(_socket: &TcpSocket) -> bool {
+    false
 }
 
 /// Classify an error returned by `connect()` (never by `bind()` — those are wrapped as
 /// [`BindError`] at the bind call site).
 ///
-/// Only [`LocalBinding`] separates the meanings of a connect-time `EADDRNOTAVAIL`:
-///
-/// - [`LocalBinding::PortRange`] — an exhausted range. Port selection is deferred to
-///   `connect()` under `IP_BIND_ADDRESS_NO_PORT`, so this is the only place it can surface.
-///   It must stay a [`BindError`]: that is the signal [`connect_with_attempt`] retries on to
-///   widen the range.
-/// - [`LocalBinding::Source`] — the destination is not reachable from the bound source, a
-///   routing failure ([`ConnectNoRoute`]) rather than a local-binding one.
-/// - [`LocalBinding::Unbound`] — nothing local was pinned, so the kernel exhausted the
-///   ephemeral range. That is a local resource limit, not a route: it stays a [`BindError`],
-///   which the L4 connector reports as an `InternalError`.
-///
-/// Collapsing these is invisible on Linux, where the kernel rejects an unusable source at
-/// `bind()`, so connect-time `EADDRNOTAVAIL` is dominated by the two local-resource cases.
-/// FreeBSD and macOS defer source validation to `connect()` and report every meaning through
-/// the one errno, so there an unroutable origin reads as `BindError` — escalated by the
-/// connector to `InternalError`, turning "no route" into "internal fault" for the caller's
-/// error handling and its metrics.
+/// A connect-time `EADDRNOTAVAIL` is a local limit — a [`BindError`], which the L4 connector
+/// reports as an `InternalError` and [`connect_with_attempt`] retries on to widen a port
+/// range — except where `source_checked_at_connect` says the kernel validated a bound source
+/// only now: then it is a routing failure ([`ConnectNoRoute`]). Read either way everywhere, it
+/// is wrong somewhere: as "no route", a Linux source that ran out of ports reads as a dead
+/// origin to every caller that fails over on route failures; as a local limit, a FreeBSD
+/// unroutable origin reads as an internal fault.
 fn wrap_os_connect_error(
     e: std::io::Error,
     context: String,
     local_addr: Option<SocketAddr>,
-    local_binding: LocalBinding,
+    source_checked_at_connect: bool,
 ) -> Box<Error> {
     let etype = match e.kind() {
         ErrorKind::ConnectionRefused => ConnectRefused,
         ErrorKind::TimedOut => ConnectTimedout,
-        ErrorKind::AddrNotAvailable => match local_binding {
-            LocalBinding::Source => ConnectNoRoute,
-            LocalBinding::PortRange | LocalBinding::Unbound => BindError,
-        },
+        ErrorKind::AddrNotAvailable if source_checked_at_connect => ConnectNoRoute,
+        ErrorKind::AddrNotAvailable => BindError,
         ErrorKind::PermissionDenied | ErrorKind::AddrInUse => InternalError,
         _ => match e.raw_os_error() {
             Some(libc::ENETUNREACH | libc::EHOSTUNREACH) => ConnectNoRoute,
@@ -1169,53 +1153,109 @@ mod test {
         // connect() return right away as the SYN goes out only when the first write() is called.
         assert!(connection_time.as_millis() < 4);
     }
-    fn eaddrnotavail(binding: LocalBinding) -> Box<Error> {
+    fn eaddrnotavail(source_checked_at_connect: bool) -> Box<Error> {
         wrap_os_connect_error(
             io::Error::from_raw_os_error(libc::EADDRNOTAVAIL),
             "test".into(),
             None,
-            binding,
+            source_checked_at_connect,
         )
     }
 
-    /// A bound source with an unreachable destination is a route failure. Reporting it as a
-    /// [`BindError`] makes the L4 connector escalate it to `InternalError`, so an unroutable
-    /// origin reads as an internal fault to every caller and metric.
+    /// A bound source the kernel validates only at `connect()` (FreeBSD, macOS), refused
+    /// there: the destination is not reachable from it, a route failure. Reported as a
+    /// [`BindError`], the L4 connector escalates it to `InternalError`, so an unroutable
+    /// origin would read as an internal fault to every caller and metric.
     #[test]
-    fn a_bound_source_reports_eaddrnotavail_as_no_route() {
-        assert_eq!(eaddrnotavail(LocalBinding::Source).etype(), &ConnectNoRoute);
+    fn a_source_checked_at_connect_reports_eaddrnotavail_as_no_route() {
+        assert_eq!(eaddrnotavail(true).etype(), &ConnectNoRoute);
     }
 
-    /// An applied `IP_LOCAL_PORT_RANGE` turns the same errno into range exhaustion. It must
-    /// stay a [`BindError`], because that is the signal `connect_with_attempt` retries on to
-    /// widen the range — classify it as a route failure and the fallback stops firing.
+    /// Every other connect-time `EADDRNOTAVAIL` is a local limit — ports ran out, an exact
+    /// 4-tuple is still held, a range is exhausted. It must stay a [`BindError`]: that is the
+    /// signal `connect_with_attempt` retries on to widen a range, and calling it "no route"
+    /// makes a caller that fails over on route failures mark a healthy origin dead.
     #[test]
-    fn an_applied_port_range_keeps_eaddrnotavail_retryable() {
-        assert_eq!(eaddrnotavail(LocalBinding::PortRange).etype(), &BindError);
+    fn every_other_eaddrnotavail_is_a_local_limit() {
+        assert_eq!(eaddrnotavail(false).etype(), &BindError);
     }
 
-    /// With nothing pinned locally the kernel ran out of ephemeral ports. That is a local
-    /// resource limit, and calling it "no route" sends an operator hunting a routing fault
-    /// while the box is actually out of ports.
-    #[test]
-    fn an_unbound_connect_reports_eaddrnotavail_as_a_local_limit() {
-        assert_eq!(eaddrnotavail(LocalBinding::Unbound).etype(), &BindError);
+    /// The real Linux case, end to end through `connect_with`: a source bound with port 0,
+    /// whose port `IP_BIND_ADDRESS_NO_PORT` leaves to `connect()`, runs out of ports towards
+    /// one destination. `set_socket` narrows the socket's own range to two ports (no
+    /// privilege needed) and binds the source itself, as a full-transparency hook does; the
+    /// connect that finds no port left must read as the local limit it is, never as a route.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_linux_source_that_runs_out_of_ports_is_a_local_limit() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin: SocketAddr = listener.local_addr().unwrap();
+        // A per-socket range narrows the system's and is ignored outside it: take its top two.
+        let system = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range").unwrap();
+        let high: u16 = system.split_whitespace().nth(1).unwrap().parse().unwrap();
+        let mut held = Vec::new();
+        let refused = loop {
+            assert!(
+                held.len() <= 2,
+                "a two-port range let {} connects through: IP_LOCAL_PORT_RANGE unsupported?",
+                held.len()
+            );
+            let attempt = connect_with(&origin, None, |socket| {
+                ip_local_port_range(socket.as_raw_fd(), high - 1, high)
+                    .or_err(SocketError, "IP_LOCAL_PORT_RANGE")?;
+                socket
+                    .bind("127.0.0.1:0".parse().unwrap())
+                    .or_err(BindError, "bind in set_socket")
+            })
+            .await;
+            match attempt {
+                Ok(stream) => held.push(stream),
+                Err(e) => break e,
+            }
+        };
+        assert_eq!(refused.etype(), &BindError, "{refused:?}");
     }
 
-    /// `set_port_range(None)` stores the `(0, 0)` reset sentinel rather than clearing the
-    /// field, and an old kernel answers `ENOPROTOOPT`. Neither narrows anything, so neither
-    /// may be recorded as a constraint — otherwise the reset state silently returns to
-    /// reporting an unroutable origin as a bind failure.
+    /// The source is read off the socket, never off the request for one, so a socket bound by
+    /// the caller's `set_socket` counts exactly like one bound through `BindTo`. An unbound
+    /// socket pins nothing; a bound address or a bound port pins a source.
+    #[cfg(all(unix, not(target_os = "linux")))]
     #[test]
-    fn a_reset_port_range_is_not_a_constraint() {
-        let sock = std::net::TcpStream::connect(
-            std::net::TcpListener::bind("127.0.0.1:0")
-                .unwrap()
-                .local_addr()
-                .unwrap(),
-        )
-        .unwrap();
-        assert!(!ip_local_port_range(sock.as_raw_fd(), 0, 0).unwrap());
+    fn a_bound_source_is_read_off_the_socket() {
+        let unbound = TcpSocket::new_v4().unwrap();
+        assert!(!source_checked_at_connect(&unbound));
+        for source in ["127.0.0.1:0", "[::1]:0", "0.0.0.0:0"] {
+            let source: std::net::SocketAddr = source.parse().unwrap();
+            let bound = if source.is_ipv4() {
+                TcpSocket::new_v4()
+            } else {
+                TcpSocket::new_v6()
+            }
+            .unwrap();
+            bound.bind(source).unwrap();
+            assert!(source_checked_at_connect(&bound), "{source}");
+        }
+    }
+
+    /// The real FreeBSD case, end to end through `connect_with`: a source bound by the
+    /// caller's `set_socket` is validated at `connect()`, which answers a loopback source
+    /// towards a public destination with `EADDRNOTAVAIL` — a route failure, read off the
+    /// socket although no `BindTo` named the source. Bounded in time: the refusal is
+    /// synchronous there, and a host that let the SYN out instead must not hang the suite.
+    #[cfg(target_os = "freebsd")]
+    #[tokio::test]
+    async fn a_source_bound_by_set_socket_is_read_off_the_socket() {
+        let public: SocketAddr = "240.0.0.1:80".parse().unwrap();
+        let attempt = connect_with(&public, None, |socket| {
+            socket
+                .bind("127.0.0.1:0".parse().unwrap())
+                .or_err(BindError, "bind in set_socket")
+        });
+        let err = tokio::time::timeout(Duration::from_secs(10), attempt)
+            .await
+            .expect("FreeBSD refuses this source at connect, without sending a SYN")
+            .unwrap_err();
+        assert_eq!(err.etype(), &ConnectNoRoute, "{err:?}");
     }
 
     /// The reading a caller takes off a connection it has not looked at yet: how long
