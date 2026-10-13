@@ -300,6 +300,9 @@ where
         // Shared signal so the upstream half can distinguish an expected task-pipe
         // closure (the downstream half finished and dropped rx) from an unexpected one.
         let pipe_state = Arc::new(AtomicU8::new(PipeState::Active as u8));
+        // Only a request whose body is still to be sent can renew a read timeout.
+        let progress =
+            (!body_empty && client_session.read_timeout.is_some()).then(RequestBodyProgress::new);
 
         /* read downstream body and upstream response at the same time */
 
@@ -313,8 +316,9 @@ where
                 &mut downstream_custom_message_writer,
                 &mut downstream_custom_message_reader,
                 pipe_state.clone(),
+                progress.as_ref(),
             ),
-            pipe_up_to_down_response(client_session, tx, pipe_state)
+            pipe_up_to_down_response(client_session, tx, pipe_state, progress.as_ref())
         );
 
         if let Some(custom_session) = session.downstream_session.as_custom_mut() {
@@ -524,6 +528,7 @@ where
             Box<dyn futures::Stream<Item = Result<Bytes>> + Unpin + Send + Sync + 'static>,
         >,
         pipe_state: Arc<AtomicU8>,
+        progress: Option<&RequestBodyProgress>,
     ) -> Result<bool>
     where
         SV: ProxyHttp<DS> + Send + Sync,
@@ -561,6 +566,7 @@ where
                 client_body,
                 ctx,
                 write_timeout,
+                progress,
             )
             .await?;
         }
@@ -653,7 +659,7 @@ where
                         }
                     };
                     let is_body_done = session.is_body_done();
-                    match self.send_body_to2(session, body, is_body_done, client_body, ctx, write_timeout).await {
+                    match self.send_body_to2(session, body, is_body_done, client_body, ctx, write_timeout, progress).await {
                         Ok(request_done) =>  {
                             downstream_state.maybe_finished(request_done);
                         },
@@ -1149,6 +1155,9 @@ where
         res
     }
 
+    /// Filter one request body chunk and write it upstream, recording on `progress` a
+    /// chunk the upstream accepted.
+    #[allow(clippy::too_many_arguments)]
     async fn send_body_to2(
         &self,
         session: &mut Session<DS>,
@@ -1157,6 +1166,7 @@ where
         client_body: &mut h2::SendStream<bytes::Bytes>,
         ctx: &mut <SV as ProxyHttp<DS>>::CTX,
         write_timeout: Option<Duration>,
+        progress: Option<&RequestBodyProgress>,
     ) -> Result<bool>
     where
         SV: ProxyHttp<DS> + Send + Sync,
@@ -1217,8 +1227,96 @@ where
                 .await
                 .map_err(|e| e.into_up())?;
         }
+        if let Some(progress) = progress {
+            progress.accepted();
+        }
 
         Ok(end_of_body)
+    }
+}
+
+/// When the upstream last accepted a request body chunk, so that an upstream read timeout
+/// bounds a silence rather than the time the request takes to send.
+///
+/// The h2 response is read concurrently with the request body, so a read timeout armed
+/// per read would cut every upload that takes longer than it to send, whatever its rate —
+/// the head read of an origin that answers after the body, and the body or trailer read of
+/// one that answered early. The h1 path re-arms its reads the same way: its duplex
+/// `select!` rebuilds the response read after every request chunk it writes.
+///
+/// Only a chunk the upstream ACCEPTED renews it: a chunk the request body filter
+/// swallowed, a write still blocked on flow control and a write that failed do not. So an
+/// origin that stops reading the body is cut by whichever of the read and write timeouts
+/// ends first, and a client that stops sending is cut by the read timeout, counted from
+/// its last chunk. Like the h1 path, and like nginx's `proxy_read_timeout`, it bounds a
+/// silence and not a total: a body that keeps trickling keeps renewing it.
+pub(crate) struct RequestBodyProgress {
+    start: std::time::Instant,
+    /// Nanoseconds after `start` of the last accepted chunk; `0` before the first.
+    last: AtomicU64,
+}
+
+impl RequestBodyProgress {
+    pub(crate) fn new() -> Self {
+        Self {
+            start: std::time::Instant::now(),
+            last: AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn accepted(&self) {
+        let at = u64::try_from(self.start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.last.store(at, Ordering::Relaxed);
+    }
+
+    /// How long since the last accepted chunk, or since this request's reads began.
+    fn idle(&self) -> Duration {
+        let last = Duration::from_nanos(self.last.load(Ordering::Relaxed));
+        self.start.elapsed().saturating_sub(last)
+    }
+}
+
+/// Restores the session's own read timeout however a renewed read ends — a cancelled
+/// read (the other half of the duplex failed) included.
+struct ReadTimeoutRestore<'a> {
+    client: &'a mut Http2Session,
+    read_timeout: Duration,
+}
+
+impl Drop for ReadTimeoutRestore<'_> {
+    fn drop(&mut self) {
+        self.client.read_timeout = Some(self.read_timeout);
+    }
+}
+
+/// Run one upstream read under the session's read timeout counted from the later of the
+/// read's start and the last request body chunk the upstream accepted. The h2 client's
+/// reads (head, body, trailers) resume after a timeout without losing what is pending, so
+/// a timeout the body has since renewed re-arms the read for what remains of it. Without a
+/// `progress` (no request body, or no read timeout) it is the plain read.
+async fn read_renewed<T>(
+    client: &mut Http2Session,
+    progress: Option<&RequestBodyProgress>,
+    mut read: impl AsyncFnMut(&mut Http2Session) -> Result<T>,
+) -> Result<T> {
+    let (Some(progress), Some(read_timeout)) = (progress, client.read_timeout) else {
+        return read(client).await;
+    };
+    let restore = ReadTimeoutRestore {
+        client,
+        read_timeout,
+    };
+    loop {
+        match read(restore.client).await {
+            Err(e) if matches!(e.etype, ReadTimedout) => {
+                let idle = progress.idle();
+                if idle >= read_timeout {
+                    return Err(e);
+                }
+                restore.client.read_timeout = Some(read_timeout - idle);
+            }
+            other => return other,
+        }
     }
 }
 
@@ -1227,11 +1325,13 @@ pub(crate) async fn pipe_up_to_down_response(
     client: &mut Http2Session,
     tx: mpsc::Sender<HttpTask>,
     pipe_state: Arc<AtomicU8>,
+    progress: Option<&RequestBodyProgress>,
 ) -> Result<()> {
-    client
-        .read_response_header()
-        .await
-        .map_err(|e| e.into_up())?; // should we send the error as an HttpTask?
+    read_renewed(client, progress, async |c: &mut Http2Session| {
+        c.read_response_header().await
+    })
+    .await
+    .map_err(|e| e.into_up())?; // should we send the error as an HttpTask?
 
     let resp_header = Box::new(client.response_header().expect("just read").clone());
 
@@ -1287,7 +1387,7 @@ pub(crate) async fn pipe_up_to_down_response(
     loop {
         let chunk = tokio::select! {
             biased;
-            body = client.read_response_body() => {
+            body = read_renewed(client, progress, async |c: &mut Http2Session| c.read_response_body().await) => {
                 body.map_err(|e| e.into_up()).transpose()
             }
             _ = tx.closed() => None,
@@ -1350,7 +1450,7 @@ pub(crate) async fn pipe_up_to_down_response(
     // attempt to get trailers, racing against channel close
     let trailers = tokio::select! {
         biased;
-        t = client.read_trailers() => {
+        t = read_renewed(client, progress, async |c: &mut Http2Session| c.read_trailers().await) => {
             match t {
                 Ok(t) => t,
                 Err(e) => {
@@ -1667,5 +1767,167 @@ mod trailered_response_tests {
             "the withheld body must be released ahead of the trailers: {wire:?}"
         );
         assert_eq!(ends, 1, "the trailer block must end the body filter");
+    }
+}
+
+#[cfg(test)]
+mod request_body_progress_tests {
+    use super::*;
+    use pingora_core::connectors::http::v2::ConnectionRef;
+    use pingora_core::protocols::Digest;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Wide against the pace below, so a loaded test runner cannot starve a renewal.
+    const READ_TIMEOUT: Duration = Duration::from_millis(500);
+    const PACE: Duration = Duration::from_millis(50);
+    /// Three read timeouts of upload at `PACE`.
+    const CHUNKS: usize = 30;
+    const CHUNK: &[u8] = &[b'u'; 100];
+
+    struct Forward;
+
+    #[async_trait]
+    impl ProxyHttp for Forward {
+        type CTX = ();
+
+        fn new_ctx(&self) -> Self::CTX {}
+
+        async fn upstream_peer(
+            &self,
+            _session: &mut Session,
+            _ctx: &mut Self::CTX,
+        ) -> Result<Box<HttpPeer>> {
+            unreachable!("the test hands proxy_down_to_up its upstream stream")
+        }
+    }
+
+    /// When the origin sends its response head: after the whole request body (an origin
+    /// that buffers the request), or at once with the body after it (a streaming RPC).
+    #[derive(Clone, Copy)]
+    enum Origin {
+        HeadAfterBody,
+        HeadFirst,
+    }
+
+    /// An h2 stream to an origin that reads the whole request body before it ends its
+    /// response, answering its head as `origin` says.
+    async fn stream_to(origin: Origin) -> Http2Session {
+        let (client_io, server_io) = tokio::io::duplex(65536);
+        tokio::spawn(async move {
+            let mut conn = h2::server::handshake(server_io).await.unwrap();
+            if let Some(Ok((request, mut respond))) = conn.accept().await {
+                tokio::spawn(async move {
+                    let head = || http::Response::builder().status(200).body(()).unwrap();
+                    let mut send = match origin {
+                        Origin::HeadFirst => Some(respond.send_response(head(), false).unwrap()),
+                        Origin::HeadAfterBody => None,
+                    };
+                    let mut body = request.into_body();
+                    while let Some(Ok(chunk)) = body.data().await {
+                        let _ = body.flow_control().release_capacity(chunk.len());
+                    }
+                    let mut send = send
+                        .take()
+                        .unwrap_or_else(|| respond.send_response(head(), false).unwrap());
+                    let _ = send.send_data(Bytes::from_static(b"ok"), true);
+                });
+            }
+            while conn.accept().await.is_some() {}
+        });
+        let (send_req, connection) = h2::client::handshake(client_io).await.unwrap();
+        let (closed_tx, closed_rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(async move {
+            let _ = connection.await;
+            let _ = closed_tx.send(true);
+        });
+        let conn = ConnectionRef::new(
+            send_req,
+            closed_rx,
+            Arc::new(AtomicBool::new(false)),
+            0,
+            1,
+            Digest::default(),
+        );
+        conn.spawn_stream().await.unwrap().expect("a stream slot")
+    }
+
+    /// Proxy one h1 upload of `CHUNKS` chunks, `PACE` apart — or, `stalled`, only half of
+    /// them, the connection then left open — through `proxy_down_to_up` to `origin`, and
+    /// return the proxy's error with what the client was answered.
+    async fn upload(origin: Origin, stalled: bool) -> (Option<Box<Error>>, String) {
+        let proxy = HttpProxy::new(Forward, Arc::new(ServerConf::default()));
+        let (client, server) = tokio::io::duplex(65536);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        client_write
+            .write_all(
+                format!(
+                    "POST /upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: {}\r\n\r\n",
+                    CHUNK.len() * CHUNKS
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        session
+            .read_request()
+            .await
+            .expect("the request head parses");
+        let sending = if stalled { CHUNKS / 2 } else { CHUNKS };
+        let writer = tokio::spawn(async move {
+            for _ in 0..sending {
+                tokio::time::sleep(PACE).await;
+                client_write.write_all(CHUNK).await.unwrap();
+            }
+            client_write // held open: a stalled client neither sends nor closes
+        });
+        let mut h2s = stream_to(origin).await;
+        let mut peer = HttpPeer::new("127.0.0.1:1", false, String::new());
+        peer.options.read_timeout = Some(READ_TIMEOUT);
+        peer.options.write_timeout = Some(READ_TIMEOUT);
+        let (_, error) = proxy
+            .proxy_down_to_up(&mut session, &mut h2s, &peer, &mut ())
+            .await;
+        let _client_write = writer.await.unwrap();
+        drop(session);
+        let mut answer = Vec::new();
+        let _ = client_read.read_to_end(&mut answer).await;
+        (error, String::from_utf8_lossy(&answer).into_owned())
+    }
+
+    /// An origin that answers only once it has the whole body is waited for while the body
+    /// still moves, for three read timeouts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_upload_longer_than_the_read_timeout_gets_a_head_sent_after_its_body() {
+        let (error, answer) = upload(Origin::HeadAfterBody, false).await;
+        assert!(error.is_none(), "{error:?}");
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+        assert!(answer.contains("\r\n\r\n2\r\nok\r\n"), "{answer}");
+    }
+
+    /// An origin that sent its head at once and its body after the request's end — a
+    /// streaming RPC — is waited for the same way: the body read is renewed too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_upload_longer_than_the_read_timeout_gets_a_body_sent_after_it() {
+        let (error, answer) = upload(Origin::HeadFirst, false).await;
+        assert!(error.is_none(), "{error:?}");
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+        assert!(answer.contains("\r\n\r\n2\r\nok\r\n"), "{answer}");
+    }
+
+    /// The positive control: an upload that stops is cut by the read timeout, counted from
+    /// its last chunk, on both origin shapes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_upload_that_stops_is_cut_by_the_read_timeout() {
+        for origin in [Origin::HeadAfterBody, Origin::HeadFirst] {
+            let started = std::time::Instant::now();
+            let (error, _) = upload(origin, true).await;
+            let error = error.expect("a stalled upload is cut");
+            assert!(matches!(error.etype, ReadTimedout), "{error:?}");
+            assert!(
+                started.elapsed() < PACE * (CHUNKS / 2) as u32 + READ_TIMEOUT * 4,
+                "cut about a read timeout after the stall, not left hanging"
+            );
+        }
     }
 }
