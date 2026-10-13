@@ -286,6 +286,7 @@ where
                 &mut custom_writer,
                 &mut custom_reader,
                 pipe_state,
+                None,
             ) => match result {
                 Err(e) => Err(e),
                 Ok(_) => panic!("the attempt ended without an upstream response"),
@@ -433,6 +434,7 @@ async fn streamed_final_chunk_still_watches_client_closure() {
                 &mut custom_writer,
                 &mut custom_reader,
                 pipe_state,
+                None,
             ) => panic!("the attempt ended before the client was noticed: {result:?}"),
             _ = async {
                 final_chunk.notified().await;
