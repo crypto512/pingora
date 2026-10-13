@@ -1,8 +1,8 @@
 # Transparent proxy socket-option test harness
 
-Functional test for the transparent-proxy socket options added to `pingora-core`
-(`TcpSocketOptions.ip_transparent` / `so_mark` on the listener, and
-`BindTo.bind_nonlocal` / `so_mark` on the upstream connector).
+Functional test for the transparent-proxy listener option added to `pingora-core`
+(`TcpSocketOptions.ip_transparent`), and for upstream source spoofing through the
+peer's `upstream_tcp_sock_tweak_hook`.
 
 It builds a small binary that links `pingora-core` and drives real traffic
 through a Linux `client -> router` network-namespace topology, covering each
@@ -12,7 +12,7 @@ mode over **both IPv4 and IPv6**, plus a dual-stack case (7 tests total):
 |------|--------------|-------------------------------|-----------------------|
 | NAT REDIRECT | `ip[6]tables -t nat ... -j REDIRECT` | `SO_ORIGINAL_DST` / `IP6T_SO_ORIGINAL_DST` | `ext::get_original_dest` |
 | TPROXY | `ip[6]tables -t mangle ... -j TPROXY` | `getsockname` (local addr) | IP_TRANSPARENT / IPV6_TRANSPARENT listener |
-| Upstream spoof | — | backend observes client IP | `ext::connect` + `BindTo::set_bind_nonlocal` |
+| Upstream spoof | replies: `-m socket --transparent` mark → fwmark → `local` route | backend (client namespace) observes the foreign source | `TransportConnector` + `upstream_tcp_sock_tweak_hook` (IP_TRANSPARENT, then bind) |
 | Dual-stack | `iptables -j TPROXY` into a `[::]` socket | `getsockname` → `::ffff:a.b.c.d` | IPV6_TRANSPARENT covers v4-mapped |
 
 For the full explanation and production host setup, see

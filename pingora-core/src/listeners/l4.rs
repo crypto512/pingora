@@ -132,12 +132,6 @@ pub struct TcpSocketOptions {
     /// `docs/user_guide/transparent_proxy.md` for the full host setup.
     #[cfg(target_os = "linux")]
     pub ip_transparent: Option<bool>,
-    /// Set SO_MARK socket option for policy routing (Linux only).
-    /// This marks packets from this socket with a firewall mark for routing decisions.
-    /// Requires CAP_NET_ADMIN capability.
-    /// See the [man page](https://man7.org/linux/man-pages/man7/socket.7.html) for more information.
-    #[cfg(target_os = "linux")]
-    pub so_mark: Option<u32>,
     // TODO: allow configuring reuseaddr, backlog, etc. from here?
 }
 
@@ -285,13 +279,6 @@ fn apply_tcp_socket_options(
                 std::io::Error::last_os_error(),
             ));
         }
-    }
-
-    #[cfg(target_os = "linux")]
-    if let Some(mark) = opt.so_mark {
-        socket_ref
-            .set_mark(mark)
-            .or_err(BindError, "failed to set SO_MARK")?;
     }
 
     #[cfg(unix)]

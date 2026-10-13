@@ -66,13 +66,20 @@ got=$(grep ORIGDST "$out" | head -1); echo "  proxy said: ${got:-<none>}"
 [ "$got" = "ORIGDST=1.2.3.4:80" ] && ok "TPROXY original dest via getsockname" || no "TPROXY original dest ($got)"
 teardown_topo; rm -f "$out"
 
-echo; echo "### TEST 3: transparent UPSTREAM spoof -> pingora ext::connect + BindTo::set_bind_nonlocal"
+echo; echo "### TEST 3: transparent UPSTREAM spoof -> TransportConnector + upstream_tcp_sock_tweak_hook"
 setup_topo
-ip netns exec rtr ip route add local 5.5.5.5/32 dev lo   # return path for spoofed source
+# The spoofed source 5.5.5.5 is foreign to rtr (no local route), so only the hook's
+# IP_TRANSPARENT lets the socket bind it. The backend runs in cli, whose default route
+# sends its replies to 5.5.5.5 back to rtr; there the user guide's section 4 recipe
+# delivers them to the transparent socket: `-m socket --transparent` marks them, and
+# the fwmark rule routes marked packets to the local table.
+ip netns exec rtr iptables -t mangle -A PREROUTING -p tcp -m socket --transparent -j MARK --set-mark 1
+ip netns exec rtr ip rule add fwmark 1 lookup 100
+ip netns exec rtr ip route add local 0.0.0.0/0 dev lo table 100
 bout=$(mktemp); cout=$(mktemp)
-ip netns exec rtr $BIN backend 127.0.0.1:9001 >"$bout" 2>/dev/null &
+ip netns exec cli $BIN backend 10.0.0.2:9001 >"$bout" 2>/dev/null &
 wait_ready "$bout"
-ip netns exec rtr $BIN upstream-spoof 127.0.0.1:9001 5.5.5.5:0 >"$cout" 2>/dev/null
+ip netns exec rtr $BIN upstream-spoof 10.0.0.2:9001 5.5.5.5:0 >"$cout" 2>/dev/null
 sleep 0.4
 peer=$(grep PEER "$bout" | head -1); conn=$(grep -E 'CONNECTED|CONNECT_ERR' "$cout" | head -1)
 echo "  client said:  ${conn:-<none>}"; echo "  backend said: ${peer:-<none>}"
@@ -103,17 +110,21 @@ got=$(grep ORIGDST "$out" | head -1); echo "  proxy said: ${got:-<none>}"
 [ "$got" = "ORIGDST=[2001:db8::1]:80" ] && ok "IPv6 TPROXY original dest via getsockname" || no "IPv6 TPROXY original dest ($got)"
 teardown_topo; rm -f "$out"
 
-echo; echo "### TEST 6 (IPv6): transparent UPSTREAM spoof -> ext::connect + BindTo::set_bind_nonlocal"
+echo; echo "### TEST 6 (IPv6): transparent UPSTREAM spoof -> TransportConnector + upstream_tcp_sock_tweak_hook"
 setup_topo
-ip netns exec rtr ip -6 route add local fd00::9/128 dev lo   # return path for spoofed v6 source
+# As TEST 3, over IPv6: a foreign source (off every on-link prefix, so cli routes its
+# replies to rtr), delivered back by the ip6tables twin of the same recipe.
+ip netns exec rtr ip6tables -t mangle -A PREROUTING -p tcp -m socket --transparent -j MARK --set-mark 1
+ip netns exec rtr ip -6 rule add fwmark 1 lookup 100
+ip netns exec rtr ip -6 route add local ::/0 dev lo table 100
 bout=$(mktemp); cout=$(mktemp)
-ip netns exec rtr $BIN backend '[::1]:9001' >"$bout" 2>/dev/null &
+ip netns exec cli $BIN backend '[fd00::2]:9001' >"$bout" 2>/dev/null &
 wait_ready "$bout"
-ip netns exec rtr $BIN upstream-spoof '[::1]:9001' '[fd00::9]:0' >"$cout" 2>/dev/null
+ip netns exec rtr $BIN upstream-spoof '[fd00::2]:9001' '[2001:db8:5::5]:0' >"$cout" 2>/dev/null
 sleep 0.4
 peer=$(grep PEER "$bout" | head -1); conn=$(grep -E 'CONNECTED|CONNECT_ERR' "$cout" | head -1)
 echo "  client said:  ${conn:-<none>}"; echo "  backend said: ${peer:-<none>}"
-echo "$peer" | grep -q '^PEER=\[fd00::9\]:' && ok "IPv6 upstream saw spoofed source fd00::9" || no "IPv6 upstream source spoof ($peer / $conn)"
+echo "$peer" | grep -q '^PEER=\[2001:db8:5::5\]:' && ok "IPv6 upstream saw spoofed source 2001:db8:5::5" || no "IPv6 upstream source spoof ($peer / $conn)"
 teardown_topo; rm -f "$bout" "$cout"
 
 echo; echo "### TEST 7 (dual-stack): [::] listener w/ only IPV6_TRANSPARENT intercepts IPv4 TPROXY"

@@ -16,7 +16,7 @@
 use crate::protocols::l4::ext::connect_uds;
 use crate::protocols::l4::ext::{
     connect_error_local_addr, connect_with_attempt as tcp_connect, set_dscp, set_recv_buf,
-    set_snd_buf, set_tcp_fastopen_connect, ConnectAttempt, ConnectErrorDetails,
+    set_tcp_fastopen_connect, ConnectAttempt, ConnectErrorDetails,
 };
 use crate::protocols::l4::socket::SocketAddr;
 use crate::protocols::l4::stream::Stream;
@@ -62,17 +62,6 @@ pub struct BindTo {
     port_range: Option<(u16, u16)>,
     // whether we fallback and try again on bind errors when a port range is set
     fallback: bool,
-    /// Allow the upstream socket to bind to and send from a non-local source
-    /// address (e.g. the client's) for fully transparent (source-spoofing)
-    /// proxying. Pair with `addr` set to the client's address. IP_TRANSPARENT on
-    /// Linux (requires CAP_NET_ADMIN); IP_BINDANY on FreeBSD (requires root).
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-    pub bind_nonlocal: bool,
-    /// Set SO_MARK on the upstream socket for policy routing, e.g. to steer
-    /// spoofed-source upstream traffic through a dedicated routing table.
-    /// Requires CAP_NET_ADMIN. Linux only.
-    #[cfg(target_os = "linux")]
-    pub so_mark: Option<u32>,
 }
 
 impl BindTo {
@@ -102,26 +91,6 @@ impl BindTo {
     /// Set whether we fallback on no address available if a port range is set
     pub fn set_fallback(&mut self, fallback: bool) {
         self.fallback = fallback
-    }
-
-    /// Allow the upstream socket to bind a non-local source address (e.g. the
-    /// client's) for fully transparent (source-spoofing) proxying. Pair this with
-    /// [`BindTo::addr`] set to the source address to spoof, and arrange the
-    /// return-flow delivery: on Linux, `IP_TRANSPARENT` (requires
-    /// `CAP_NET_ADMIN`) plus a local return route (`ip route add local <src> dev
-    /// lo`); on FreeBSD, `IP_BINDANY` (requires root) plus an ipfw `fwd` rule for
-    /// the reply flow.
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-    pub fn set_bind_nonlocal(&mut self, nonlocal: bool) {
-        self.bind_nonlocal = nonlocal
-    }
-
-    /// Set `SO_MARK` on the upstream socket for policy routing, e.g. to steer
-    /// spoofed-source upstream traffic through a dedicated routing table.
-    /// Requires `CAP_NET_ADMIN`. Linux only.
-    #[cfg(target_os = "linux")]
-    pub fn set_so_mark(&mut self, mark: Option<u32>) {
-        self.so_mark = mark
     }
 
     /// Configured bind port range
@@ -169,10 +138,6 @@ where
                             if let Some(recv_buf) = peer.tcp_recv_buf() {
                                 debug!("Setting recv buf size");
                                 set_recv_buf(raw, recv_buf)?;
-                            }
-                            if let Some(snd_buf) = peer.tcp_snd_buf() {
-                                debug!("Setting snd buf size");
-                                set_snd_buf(raw, snd_buf)?;
                             }
                             if let Some(dscp) = peer.dscp() {
                                 debug!("Setting dscp");

@@ -243,43 +243,6 @@ fn ip_local_port_range(_fd: RawSocket, _low: u16, _high: u16) -> io::Result<()> 
     Ok(())
 }
 
-/// Allow the socket to bind to and send from a non-local source address, e.g.
-/// the intercepted client's, for fully transparent (source-spoofing) proxying.
-/// Must be set before bind().
-///
-/// Linux: IP_TRANSPARENT / IPV6_TRANSPARENT; requires CAP_NET_ADMIN.
-#[cfg(target_os = "linux")]
-fn set_bind_nonlocal(fd: RawFd, is_ipv6: bool) -> io::Result<()> {
-    if is_ipv6 {
-        set_opt(
-            fd,
-            libc::IPPROTO_IPV6,
-            libc::IPV6_TRANSPARENT,
-            true as c_int,
-        )
-    } else {
-        set_opt(fd, libc::IPPROTO_IP, libc::IP_TRANSPARENT, true as c_int)
-    }
-}
-
-/// FreeBSD: IP_BINDANY / IPV6_BINDANY; requires PRIV_NETINET_BINDANY (root).
-/// The reply flow for the spoofed source is delivered back to this socket by
-/// ipfw `fwd`, the FreeBSD analogue of the Linux TPROXY socket-transparent rule.
-#[cfg(target_os = "freebsd")]
-fn set_bind_nonlocal(fd: RawFd, is_ipv6: bool) -> io::Result<()> {
-    if is_ipv6 {
-        set_opt(fd, libc::IPPROTO_IPV6, libc::IPV6_BINDANY, true as c_int)
-    } else {
-        set_opt(fd, libc::IPPROTO_IP, libc::IP_BINDANY, true as c_int)
-    }
-}
-
-/// Set SO_MARK on the socket for policy routing.
-#[cfg(target_os = "linux")]
-fn set_so_mark(fd: RawFd, mark: u32) -> io::Result<()> {
-    set_opt(fd, libc::SOL_SOCKET, libc::SO_MARK, mark as c_int)
-}
-
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn set_so_keepalive(fd: RawFd, val: bool) -> io::Result<()> {
     set_opt(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, val as c_int)
@@ -705,15 +668,6 @@ pub(crate) async fn connect_with_attempt<F: FnOnce(&TcpSocket) -> Result<()> + C
             if matches!(e.etype(), BindError) {
                 let mut new_bind_to = BindTo::default();
                 new_bind_to.addr = bind_to.as_ref().and_then(|b| b.addr);
-                // preserve transparent proxy settings across the retry
-                #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-                {
-                    new_bind_to.bind_nonlocal = bind_to.as_ref().is_some_and(|b| b.bind_nonlocal);
-                }
-                #[cfg(target_os = "linux")]
-                {
-                    new_bind_to.so_mark = bind_to.as_ref().and_then(|b| b.so_mark);
-                }
                 // reset the port range
                 new_bind_to.set_port_range(None).unwrap();
                 return inner_connect_with(addr, Some(&new_bind_to), set_socket, attempt).await;
@@ -748,47 +702,12 @@ async fn inner_connect_with<F: FnOnce(&TcpSocket) -> Result<()>>(
         )?;
 
         if let Some(bind_to) = bind_to {
-            // The non-local-bind option must be set before bind() so the socket can
-            // bind a spoofed (client) source address for full transparency.
-            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-            if bind_to.bind_nonlocal {
-                set_bind_nonlocal(socket.as_raw_fd(), addr.is_ipv6()).or_err(
-                    SocketError,
-                    "failed to set socket opts IP_TRANSPARENT/IP_BINDANY",
-                )?;
-            }
-
-            #[cfg(target_os = "linux")]
-            if let Some(mark) = bind_to.so_mark {
-                set_so_mark(socket.as_raw_fd(), mark)
-                    .or_err(SocketError, "failed to set socket opts SO_MARK")?;
-            }
-
             if let Some((low, high)) = bind_to.port_range() {
                 ip_local_port_range(socket.as_raw_fd(), low, high)
                     .or_err(SocketError, "failed to set socket opts IP_LOCAL_PORT_RANGE")?;
             }
 
             if let Some(baddr) = bind_to.addr {
-                // SO_REUSEADDR before bind() lets the upstream socket bind a client's
-                // *exact* source ip:port while an earlier connection on it lingers in
-                // TIME_WAIT; it never lets two live sockets share a 4-tuple. That is its
-                // one use, so a port-0 bind never takes it.
-                //
-                // Where bind() picks the port itself (every platform but Linux, whose
-                // IP_BIND_ADDRESS_NO_PORT defers the pick to connect(), where the flag
-                // plays no part), SO_REUSEADDR narrows the pick's check to UNCONNECTED
-                // sockets (FreeBSD's `in_pcbbind_setup`): a port already carrying a
-                // connection to the same destination — live or in TIME_WAIT — is handed
-                // out again, and connect() fails EADDRINUSE on the identical 4-tuple.
-                // Without it the pick skips every socket on that address and port, so a
-                // source-bound connect never collides; the bound is then one port per
-                // connection per source address, reported at bind() as EADDRNOTAVAIL.
-                if baddr.port() != 0 {
-                    socket
-                        .set_reuseaddr(true)
-                        .or_err(SocketError, "failed to set socket opts SO_REUSEADDR")?;
-                }
                 socket
                     .bind(baddr)
                     .or_err_with(BindError, || format!("failed to bind to socket {}", baddr))?;
@@ -799,12 +718,6 @@ async fn inner_connect_with<F: FnOnce(&TcpSocket) -> Result<()>>(
     #[cfg(windows)]
     if let Some(bind_to) = bind_to {
         if let Some(baddr) = bind_to.addr {
-            // See the unix branch: only an exact port rebinds a TIME_WAIT-held address.
-            if baddr.port() != 0 {
-                socket
-                    .set_reuseaddr(true)
-                    .or_err(SocketError, "failed to set socket opts SO_REUSEADDR")?;
-            }
             socket
                 .bind(baddr)
                 .or_err_with(BindError, || format!("failed to bind to socket {}", baddr))?;
@@ -1036,81 +949,6 @@ mod test {
                 "SO_SNDBUF must reach the kernel; a no-op setter reads back 0"
             );
         }
-    }
-
-    /// The non-local-bind option is what lets a fully transparent proxy source
-    /// its upstream socket from the intercepted client's address. TEST-NET-1 is
-    /// guaranteed foreign, so the plain bind failing is the control that proves
-    /// the option — not the host's routing table — is what admits the bind.
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-    #[ignore] // requires CAP_NET_ADMIN (Linux) / root (FreeBSD)
-    #[test]
-    fn test_bind_nonlocal_admits_a_foreign_source() {
-        use tokio::net::TcpSocket;
-        let foreign: SocketAddr = "192.0.2.1:0".parse().unwrap();
-
-        let plain = TcpSocket::new_v4().unwrap();
-        assert!(
-            plain.bind(foreign).is_err(),
-            "TEST-NET-1 must not be bindable without the non-local option"
-        );
-
-        let sock = TcpSocket::new_v4().unwrap();
-        set_bind_nonlocal(sock.as_raw_fd(), false).unwrap();
-        sock.bind(foreign).unwrap();
-    }
-
-    /// Many source-bound connections to ONE destination all connect. Where bind() picks
-    /// the port (every platform but Linux), a pick that ignored connected sockets hands a
-    /// port out twice and connect() fails EADDRINUSE on the identical 4-tuple: with 1000
-    /// connections over FreeBSD's ~55k-port range, ~9 collisions are expected (none in
-    /// ~1e-4 of runs).
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn test_source_bound_connects_to_one_destination_never_collide() {
-        const WANTED: usize = 1000;
-        // The client ends are held open — a closed one frees its tuple — so the process
-        // needs room for them beside every other test's descriptors: a 1024 soft limit
-        // would fail this on EMFILE instead of on a collision.
-        let mut limit = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // SAFETY: getrlimit/setrlimit write and read only the struct passed.
-        unsafe {
-            assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit), 0);
-            let want = (4 * WANTED) as libc::rlim_t;
-            if limit.rlim_cur < want {
-                limit.rlim_cur = want.min(limit.rlim_max);
-                assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &limit), 0);
-            }
-        }
-        // Under a hard limit too low to raise past, fewer connections: a weaker net (512
-        // expects ~2.4 collisions) rather than a failure on EMFILE.
-        let connections = WANTED.min(limit.rlim_cur as usize / 2);
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let remote_addr = listener.local_addr().unwrap();
-        // The accepted ends are dropped at once: the tuple lives on in the client's socket.
-        let accepted = tokio::spawn(async move { while listener.accept().await.is_ok() {} });
-
-        let mut bind_to = BindTo::default();
-        bind_to.addr = Some("127.0.0.1:0".parse().unwrap());
-        let mut connected = Vec::with_capacity(connections);
-        let mut collisions = 0;
-        for _ in 0..connections {
-            match connect(&remote_addr, Some(&bind_to)).await {
-                Ok(stream) => connected.push(stream),
-                Err(e) if format!("{e}").contains("in use") => collisions += 1,
-                Err(e) => panic!("an unexpected connect failure: {e}"),
-            }
-        }
-        assert_eq!(
-            collisions, 0,
-            "a source-bound connect must never be handed a port whose 4-tuple is taken"
-        );
-        drop(connected);
-        accepted.abort();
     }
 
     #[tokio::test]

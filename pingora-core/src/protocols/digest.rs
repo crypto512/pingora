@@ -19,9 +19,7 @@ use std::time::{Duration, SystemTime};
 
 use once_cell::sync::OnceCell;
 
-use super::l4::ext::{
-    get_original_dest, get_recv_buf, get_snd_buf, get_tcp_info, set_recv_buf, set_snd_buf, TCP_INFO,
-};
+use super::l4::ext::{get_original_dest, get_recv_buf, get_snd_buf, get_tcp_info, TCP_INFO};
 use super::l4::socket::SocketAddr;
 use super::raw_connect::ProxyDigest;
 use super::tls::digest::SslDigest;
@@ -90,18 +88,6 @@ pub struct SocketDigest {
     pub local_addr: OnceCell<Option<SocketAddr>>,
     /// Original destination address
     pub original_dst: OnceCell<Option<SocketAddr>>,
-    /// The TLS SNI (transparent) or CONNECT authority (explicit) the connection was
-    /// intercepted for, stamped by the interception front-end so the decrypted inner
-    /// pipeline can compare it against the request's `Host` header. Unset on any path
-    /// that was not TLS-intercepted for a named host.
-    pub peeked_sni: OnceCell<String>,
-    /// The full guarded, ordered upstream address set an interception front-end
-    /// resolved for the intercepted destination, stamped so the decrypted inner
-    /// pipeline can fail over across the addresses WITHOUT re-resolving — a second
-    /// lookup would reopen a DNS-rebinding window between the address policy judged
-    /// and the address dialed. The first element equals `original_dst`. Unset when
-    /// the destination is a single address (nothing to fail over to).
-    pub upstream_candidates: OnceCell<Vec<std::net::SocketAddr>>,
 }
 
 impl SocketDigest {
@@ -112,8 +98,6 @@ impl SocketDigest {
             peer_addr: OnceCell::new(),
             local_addr: OnceCell::new(),
             original_dst: OnceCell::new(),
-            peeked_sni: OnceCell::new(),
-            upstream_candidates: OnceCell::new(),
         }
     }
 
@@ -124,8 +108,6 @@ impl SocketDigest {
             peer_addr: OnceCell::new(),
             local_addr: OnceCell::new(),
             original_dst: OnceCell::new(),
-            peeked_sni: OnceCell::new(),
-            upstream_candidates: OnceCell::new(),
         }
     }
 
@@ -222,26 +204,6 @@ impl SocketDigest {
         } else {
             None
         }
-    }
-
-    /// Set both socket buffer sizes on the underlying socket (SO_SNDBUF and
-    /// SO_RCVBUF). No-op on a non-inet socket.
-    #[cfg(unix)]
-    pub fn set_buf_sizes(&self, val: usize) -> pingora_error::Result<()> {
-        if self.is_inet() {
-            set_snd_buf(self.raw_fd, val)?;
-            set_recv_buf(self.raw_fd, val)?;
-        }
-        Ok(())
-    }
-
-    #[cfg(windows)]
-    pub fn set_buf_sizes(&self, val: usize) -> pingora_error::Result<()> {
-        if self.is_inet() {
-            set_snd_buf(self.raw_sock, val)?;
-            set_recv_buf(self.raw_sock, val)?;
-        }
-        Ok(())
     }
 
     #[cfg(unix)]
