@@ -317,6 +317,7 @@ where
                 &mut downstream_custom_message_reader,
                 pipe_state.clone(),
                 progress.as_ref(),
+                body_empty,
             ),
             pipe_up_to_down_response(client_session, tx, pipe_state, progress.as_ref())
         );
@@ -529,6 +530,7 @@ where
         >,
         pipe_state: Arc<AtomicU8>,
         progress: Option<&RequestBodyProgress>,
+        header_ended_stream: bool,
     ) -> Result<bool>
     where
         SV: ProxyHttp<DS> + Send + Sync,
@@ -557,8 +559,41 @@ where
 
         let mut downstream_state = DownstreamStateMachine::new(session.as_mut().is_body_done());
 
+        let buffer = session.as_mut().get_retry_buffer();
+
+        // A body a filter already CONSUMED — a proxy that adapts a WHOLE request before
+        // forwarding it, the ICAP REQMOD ordering `proxy_h1`'s pre-loop also serves. The
+        // select loop never polls a downstream reader that is already finished, so the
+        // filters get their one end-of-stream call here, and what they release is
+        // written by the loop below, one flow-control grant at a time beside the
+        // response — never in one write here, where a large release would hold the
+        // response pipe, renew no read timeout and turn an early answer into an error.
+        //
+        // Not a body whose END_STREAM already went out (`header_ended_stream`: on the
+        // request HEADERS or on an empty DATA frame — DATA after it is a stream error),
+        // nor one a previous attempt consumed and the retry buffer could not keep: that
+        // body is lost, and ending the stream would forward it as complete and empty.
+        // A body the client cut short is the consuming filter's to refuse — its read
+        // returned the error — as on `proxy_h1`: what the filter releases is what goes.
+        let consumed = buffer.is_none()
+            && !header_ended_stream
+            && downstream_state.is_done()
+            && !session.as_ref().retry_buffer_truncated();
+        let mut release: Option<Bytes> = None;
+        if consumed {
+            let mut data = None;
+            session
+                .downstream_modules_ctx
+                .request_body_filter(&mut data, true)
+                .await?;
+            self.inner
+                .request_body_filter(session, &mut data, true, ctx)
+                .await?;
+            release = Some(data.unwrap_or_default());
+        }
+
         // retry, send buffer if it exists
-        if let Some(buffer) = session.as_mut().get_retry_buffer() {
+        if let Some(buffer) = buffer {
             self.send_body_to2(
                 session,
                 Some(buffer),
@@ -700,6 +735,28 @@ where
                             downstream_state.to_errored();
                         }
                     };
+                },
+
+                // A consumed body's release: one flow-control grant per iteration, so the
+                // response keeps flowing beside it and every grant the upstream accepted
+                // renews the read timeout. A failed write is handled as the body read's is
+                // above: the request is done, and the response is still drained.
+                released = release_one_grant(client_body, &mut release, write_timeout), if release.is_some() => {
+                    match released {
+                        Ok(ended) => {
+                            if let Some(progress) = progress {
+                                progress.accepted();
+                            }
+                            if ended {
+                                release = None;
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Upstream h2 body send error: {e}");
+                            release = None;
+                            downstream_state.to_errored();
+                        }
+                    }
                 },
 
                 // Handle buffered upstream task from previous iteration
@@ -1233,6 +1290,52 @@ where
 
         Ok(end_of_body)
     }
+}
+
+/// Write one flow-control grant of a released request body, ending the stream with its
+/// last byte — or, for a release that is empty, a standalone END_STREAM. The wait for the
+/// grant is bounded by `write_timeout`, as [`write_body`]'s is. Returns whether the stream
+/// was ended. Pends forever on no release, so a select branch can hold it disabled.
+///
+/// Cancel-safe: the only await is the grant, and a grant not yet spent stays assigned to
+/// the stream for the next call.
+async fn release_one_grant(
+    writer: &mut h2::SendStream<Bytes>,
+    release: &mut Option<Bytes>,
+    write_timeout: Option<Duration>,
+) -> Result<bool> {
+    let Some(remaining) = release.as_mut() else {
+        return std::future::pending().await;
+    };
+    if remaining.is_empty() {
+        writer
+            .send_data(Bytes::new(), true)
+            .or_err(WriteError, "while ending h2 request body")?;
+        return Ok(true);
+    }
+    writer.reserve_capacity(remaining.len());
+    let grant = async {
+        match std::future::poll_fn(|cx| writer.poll_capacity(cx)).await {
+            None => Error::e_explain(H2Error, "cannot reserve capacity"),
+            Some(ready) => ready.or_err(H2Error, "while waiting for capacity"),
+        }
+    };
+    let granted = match write_timeout {
+        Some(t) => match tokio::time::timeout(t, grant).await {
+            Ok(granted) => granted?,
+            Err(_) => Error::e_explain(
+                WriteTimedout,
+                format!("while writing h2 request body, timeout: {t:?}"),
+            )?,
+        },
+        None => grant.await?,
+    };
+    let chunk = remaining.split_to(granted.min(remaining.len()));
+    let ended = remaining.is_empty();
+    writer
+        .send_data(chunk, ended)
+        .or_err(WriteError, "while writing h2 request body")?;
+    Ok(ended)
 }
 
 /// When the upstream last accepted a request body chunk, so that an upstream read timeout
@@ -1802,16 +1905,21 @@ mod request_body_progress_tests {
     }
 
     /// When the origin sends its response head: after the whole request body (an origin
-    /// that buffers the request), or at once with the body after it (a streaming RPC).
+    /// that buffers the request), or at once with the body after it (a streaming RPC). The
+    /// echoing origins answer after the body with the body they received — `SlowEcho`
+    /// reading it a `PACE` per DATA frame, so a body larger than one flow-control window
+    /// takes several of them to send.
     #[derive(Clone, Copy)]
-    enum Origin {
+    pub(super) enum Origin {
         HeadAfterBody,
         HeadFirst,
+        Echo,
+        SlowEcho,
     }
 
     /// An h2 stream to an origin that reads the whole request body before it ends its
     /// response, answering its head as `origin` says.
-    async fn stream_to(origin: Origin) -> Http2Session {
+    pub(super) async fn stream_to(origin: Origin) -> Http2Session {
         let (client_io, server_io) = tokio::io::duplex(65536);
         tokio::spawn(async move {
             let mut conn = h2::server::handshake(server_io).await.unwrap();
@@ -1820,16 +1928,25 @@ mod request_body_progress_tests {
                     let head = || http::Response::builder().status(200).body(()).unwrap();
                     let mut send = match origin {
                         Origin::HeadFirst => Some(respond.send_response(head(), false).unwrap()),
-                        Origin::HeadAfterBody => None,
+                        _ => None,
                     };
                     let mut body = request.into_body();
+                    let mut received = Vec::new();
                     while let Some(Ok(chunk)) = body.data().await {
+                        if matches!(origin, Origin::SlowEcho) {
+                            tokio::time::sleep(PACE).await;
+                        }
                         let _ = body.flow_control().release_capacity(chunk.len());
+                        received.extend_from_slice(&chunk);
                     }
+                    let answer = match origin {
+                        Origin::Echo | Origin::SlowEcho => Bytes::from(received),
+                        Origin::HeadAfterBody | Origin::HeadFirst => Bytes::from_static(b"ok"),
+                    };
                     let mut send = send
                         .take()
                         .unwrap_or_else(|| respond.send_response(head(), false).unwrap());
-                    let _ = send.send_data(Bytes::from_static(b"ok"), true);
+                    let _ = send.send_data(answer, true);
                 });
             }
             while conn.accept().await.is_some() {}
@@ -1929,5 +2046,178 @@ mod request_body_progress_tests {
                 "cut about a read timeout after the stall, not left hanging"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod consumed_request_body_tests {
+    use super::request_body_progress_tests::{stream_to, Origin};
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const UPLOAD: &[u8] = b"upload-body!";
+    /// The adaptation a REQMOD service hands back: the upload's length, so the forwarded
+    /// `Content-Length` still frames it.
+    const ADAPTED: &[u8] = b"ADAPTED-BODY";
+    /// Four default flow-control windows: a release that takes many grants to send.
+    const LARGE: usize = 256 * 1024;
+    /// What a stream that is never given its body is cut at — well short of the time a
+    /// `SlowEcho` origin takes to read a `LARGE` body (a `PACE` per 16 KiB DATA frame).
+    const READ_TIMEOUT: Duration = Duration::from_millis(500);
+
+    /// A proxy shaped like an ICAP REQMOD client: the body was read whole before the
+    /// upstream was dialled, and its adaptation is released at the one end-of-stream.
+    struct ReleaseAdapted;
+
+    #[async_trait]
+    impl ProxyHttp for ReleaseAdapted {
+        type CTX = Option<Bytes>;
+
+        fn new_ctx(&self) -> Self::CTX {
+            None
+        }
+
+        async fn upstream_peer(
+            &self,
+            _session: &mut Session,
+            _ctx: &mut Self::CTX,
+        ) -> Result<Box<HttpPeer>> {
+            unreachable!("the test hands proxy_down_to_up its upstream stream")
+        }
+
+        async fn request_body_filter(
+            &self,
+            _session: &mut Session,
+            body: &mut Option<Bytes>,
+            end_of_stream: bool,
+            ctx: &mut Self::CTX,
+        ) -> Result<()> {
+            if end_of_stream {
+                if let Some(adapted) = ctx.take() {
+                    *body = Some(adapted);
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// Proxy one h1 request (`head`, then `body`) to an h2 `origin` after reading its whole
+    /// body first, as `request_filter` does, with `ctx` the adaptation to release; return
+    /// the proxy's error, the adaptation left unreleased, and what the client was answered.
+    async fn consumed_then_proxied(
+        origin: Origin,
+        head: &str,
+        body: &[u8],
+        mut ctx: Option<Bytes>,
+    ) -> (Option<Box<Error>>, Option<Bytes>, String) {
+        let proxy = HttpProxy::new(ReleaseAdapted, Arc::new(ServerConf::default()));
+        // Room for the whole request and answer, so neither side waits on the other.
+        let (client, server) = tokio::io::duplex(4 * LARGE);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        client_write.write_all(head.as_bytes()).await.unwrap();
+        client_write.write_all(body).await.unwrap();
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        session
+            .read_request()
+            .await
+            .expect("the request head parses");
+        let mut consumed = Vec::new();
+        while let Some(chunk) = session
+            .read_request_body()
+            .await
+            .expect("the request body reads")
+        {
+            consumed.extend_from_slice(&chunk);
+        }
+        assert_eq!(consumed, body);
+        assert!(session.as_mut().is_body_done());
+
+        let mut h2s = stream_to(origin).await;
+        let mut peer = HttpPeer::new("127.0.0.1:1", false, String::new());
+        peer.options.read_timeout = Some(READ_TIMEOUT);
+        peer.options.write_timeout = Some(READ_TIMEOUT);
+        let (_, error) = proxy
+            .proxy_down_to_up(&mut session, &mut h2s, &peer, &mut ctx)
+            .await;
+        drop(session);
+        let mut answer = Vec::new();
+        let _ = client_read.read_to_end(&mut answer).await;
+        drop(client_write);
+        (error, ctx, String::from_utf8_lossy(&answer).into_owned())
+    }
+
+    /// A body `request_filter` read whole, before the upstream was dialled, still reaches
+    /// an h2 upstream — as the filter's adaptation, released at its end-of-stream — rather
+    /// than leaving the stream with HEADERS and no DATA until its read timeout.
+    #[tokio::test]
+    async fn a_body_a_filter_consumed_is_released_to_an_h2_upstream() {
+        let head = format!(
+            "POST /upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: {}\r\n\r\n",
+            UPLOAD.len()
+        );
+        let (error, unreleased, answer) = consumed_then_proxied(
+            Origin::Echo,
+            &head,
+            UPLOAD,
+            Some(Bytes::from_static(ADAPTED)),
+        )
+        .await;
+        assert!(error.is_none(), "{error:?}");
+        assert!(
+            unreleased.is_none(),
+            "the filter must be given its end-of-stream"
+        );
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+        assert!(
+            answer.contains("ADAPTED-BODY"),
+            "the origin must receive the adaptation: {answer}"
+        );
+    }
+
+    /// A release larger than the flow-control window goes out grant by grant, each one
+    /// renewing the read timeout: an origin that reads it slowly — for longer than the read
+    /// timeout, but never silent for that long — gets all of it and answers. Written in one
+    /// piece, the release would renew nothing until its last byte, and the head read would
+    /// be cut while the body was still moving.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_large_release_renews_the_read_timeout_as_the_origin_accepts_it() {
+        let upload = vec![b'u'; LARGE];
+        // Not a hex digit, so the chunk-size lines of the client's answer cannot add any.
+        let adapted = Bytes::from(vec![b'Z'; LARGE]);
+        let head = format!(
+            "POST /upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: {LARGE}\r\n\r\n"
+        );
+        let started = std::time::Instant::now();
+        let (error, unreleased, answer) =
+            consumed_then_proxied(Origin::SlowEcho, &head, &upload, Some(adapted)).await;
+        assert!(error.is_none(), "{error:?}");
+        assert!(unreleased.is_none());
+        assert!(
+            started.elapsed() > READ_TIMEOUT,
+            "the origin read for longer than one read timeout"
+        );
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer:.200}");
+        assert_eq!(
+            answer.bytes().filter(|b| *b == b'Z').count(),
+            LARGE,
+            "the origin must receive the whole release"
+        );
+    }
+
+    /// The control: a bodyless request, whose END_STREAM went out with its header, is
+    /// given no release after it — the filter is not asked for one, so no DATA can follow
+    /// the end of the stream — and is answered.
+    #[tokio::test]
+    async fn a_bodyless_request_sends_no_data_after_its_header_ended_the_stream() {
+        let head = "GET /page HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let (error, unreleased, answer) =
+            consumed_then_proxied(Origin::Echo, head, b"", Some(Bytes::from_static(ADAPTED))).await;
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(
+            unreleased.as_deref(),
+            Some(ADAPTED),
+            "a bodyless request releases nothing"
+        );
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
     }
 }
