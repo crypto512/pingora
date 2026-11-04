@@ -566,8 +566,11 @@ where
         //
         // This reads `request_body_finished`, not `downstream_state.is_done()`: a downstream
         // abandoned during a cache fill is also "done" there with its body unfinished, and an
-        // end-of-stream here would forward that body as complete.
-        if should_send_initial_body || request_body_finished {
+        // end-of-stream here would forward that body as complete. Nor one a previous attempt
+        // consumed past what the retry buffer could keep: that body is lost, and ending the
+        // request would forward it as complete and empty.
+        let consumed = request_body_finished && !session.as_ref().retry_buffer_truncated();
+        if should_send_initial_body || consumed {
             let send_permit = tx
                 .reserve()
                 .await
@@ -1885,6 +1888,90 @@ mod tests {
         assert!(
             CANCELLATION_WATCHED_STORAGE.is_committed(path).await,
             "a fill that did not opt in was discarded for a cancellation"
+        );
+    }
+
+    /// Run a second proxy attempt for a chunked upload of `len` bytes that the first attempt
+    /// read whole with retry buffering on, against an origin that never answers; return the
+    /// bytes that origin received.
+    async fn attempt_after_body_was_read(len: usize) -> Vec<u8> {
+        let proxy = HttpProxy::new(UpstreamLoopOnly, Arc::new(ServerConf::default()));
+        let (client, server) = tokio::io::duplex(4 * 64 * 1024 + 2 * len);
+        let (_client_read, mut client_write) = tokio::io::split(client);
+        client_write
+            .write_all(
+                b"POST /upload HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        client_write
+            .write_all(format!("{len:x}\r\n").as_bytes())
+            .await
+            .unwrap();
+        client_write.write_all(&vec![b'u'; len]).await.unwrap();
+        client_write.write_all(b"\r\n0\r\n\r\n").await.unwrap();
+
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        session
+            .read_request()
+            .await
+            .expect("the request head parses");
+        session.as_mut().enable_retry_buffering();
+        while session
+            .read_request_body()
+            .await
+            .expect("the request body reads")
+            .is_some()
+        {}
+        assert!(session.as_mut().is_body_done());
+
+        let (proxy_io, mut origin_io) = tokio::io::duplex(4 * 64 * 1024 + 2 * len);
+        let mut upstream = HttpSessionV1::new(Box::new(proxy_io));
+        let mut peer = HttpPeer::new("127.0.0.1:1", false, String::new());
+        peer.options.read_timeout = Some(Duration::from_millis(200));
+        let proxied = async {
+            let outcome = proxy
+                .proxy_1to1(&mut session, &mut upstream, &peer, &mut ())
+                .await;
+            drop(upstream);
+            outcome
+        };
+        let origin = async {
+            let mut received = Vec::new();
+            let _ = origin_io.read_to_end(&mut received).await;
+            received
+        };
+        let (_, received) = tokio::join!(proxied, origin);
+        received
+    }
+
+    /// A body a previous attempt consumed past what the retry buffer could keep is lost, so
+    /// the next attempt must not end the request: its chunked terminator would forward an
+    /// upload the origin never received as complete and empty.
+    #[tokio::test]
+    async fn a_body_lost_past_a_truncated_retry_buffer_is_not_forwarded_as_complete() {
+        let received = attempt_after_body_was_read(64 * 1024 + 1).await;
+        let received = String::from_utf8_lossy(&received);
+        assert!(
+            received.starts_with("POST /upload HTTP/1.1\r\n"),
+            "the attempt must reach the origin: {received:?}"
+        );
+        assert!(
+            !received.ends_with("0\r\n\r\n"),
+            "the lost body must not be ended as complete: {received:?}"
+        );
+    }
+
+    /// The control for the test above: a body the retry buffer kept whole is replayed and
+    /// ended, so "not ended" there is the truncation's effect and not an attempt that ends
+    /// nothing.
+    #[tokio::test]
+    async fn a_body_the_retry_buffer_kept_is_replayed_and_ended() {
+        let received = attempt_after_body_was_read(16).await;
+        let received = String::from_utf8_lossy(&received);
+        assert!(
+            received.contains(&"u".repeat(16)) && received.ends_with("0\r\n\r\n"),
+            "a kept body must be replayed whole and ended: {received:?}"
         );
     }
 

@@ -2946,6 +2946,73 @@ mod consumed_request_body_tests {
         (error, ctx, String::from_utf8_lossy(&answer).into_owned())
     }
 
+    /// Run a second proxy attempt for an upload of `len` bytes that the first attempt read
+    /// whole with retry buffering on, against an origin that answers once it has the whole
+    /// body; return the proxy's error and what the client was answered.
+    async fn attempt_after_body_was_read(len: usize) -> (Option<Box<Error>>, String) {
+        let proxy = HttpProxy::new(ReleaseAdapted, Arc::new(ServerConf::default()));
+        let (client, server) = tokio::io::duplex(4 * LARGE);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        // Chunked: with a `Content-Length` the h2 library itself refuses to end a stream short of
+        // it, so only a body with no declared length depends on the proxy not ending it.
+        let head = format!(
+            "POST /upload HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n{len:x}\r\n"
+        );
+        client_write.write_all(head.as_bytes()).await.unwrap();
+        client_write.write_all(&vec![b'u'; len]).await.unwrap();
+        client_write.write_all(b"\r\n0\r\n\r\n").await.unwrap();
+        let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
+        session
+            .read_request()
+            .await
+            .expect("the request head parses");
+        session.as_mut().enable_retry_buffering();
+        while session
+            .read_request_body()
+            .await
+            .expect("the request body reads")
+            .is_some()
+        {}
+        assert!(session.as_mut().is_body_done());
+
+        let mut h2s = stream_to(Origin::Echo).await;
+        let mut peer = HttpPeer::new("127.0.0.1:1", false, String::new());
+        peer.options.read_timeout = Some(READ_TIMEOUT);
+        peer.options.write_timeout = Some(READ_TIMEOUT);
+        let (_, error) = proxy
+            .proxy_down_to_up(&mut session, &mut h2s, &peer, &mut None)
+            .await;
+        drop(session);
+        let mut answer = Vec::new();
+        let _ = client_read.read_to_end(&mut answer).await;
+        drop(client_write);
+        (error, String::from_utf8_lossy(&answer).into_owned())
+    }
+
+    /// A body a previous attempt consumed past what the retry buffer could keep is lost, so
+    /// the next attempt must not end the stream: the origin would answer an upload it never
+    /// received as complete and empty.
+    #[tokio::test]
+    async fn a_body_lost_past_a_truncated_retry_buffer_is_not_ended_on_h2() {
+        let (error, answer) = attempt_after_body_was_read(64 * 1024 + 1).await;
+        assert!(error.is_some(), "the attempt must fail, answered: {answer}");
+        assert!(
+            !answer.starts_with("HTTP/1.1 200"),
+            "the origin must not answer the lost body as complete: {answer}"
+        );
+    }
+
+    /// The control for the test above: a body the retry buffer kept whole is replayed and
+    /// ended, so the failure there is the truncation's effect and not an attempt that ends
+    /// nothing.
+    #[tokio::test]
+    async fn a_body_the_retry_buffer_kept_is_replayed_and_ended_on_h2() {
+        let (error, answer) = attempt_after_body_was_read(16).await;
+        assert!(error.is_none(), "{error:?}");
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+        assert!(answer.contains(&"u".repeat(16)), "{answer}");
+    }
+
     /// A body `request_filter` read whole, before the upstream was dialled, still reaches
     /// an h2 upstream — as the filter's adaptation, released at its end-of-stream — rather
     /// than leaving the stream with HEADERS and no DATA until its read timeout.
